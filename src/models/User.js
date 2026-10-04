@@ -1,0 +1,239 @@
+const mongoose = require('mongoose');
+const jwt = require('jsonwebtoken');
+
+const UserSchema = new mongoose.Schema({
+  userName: {
+    type: String,
+    trim: true,
+  },
+  contactNumber: {
+    type: String,
+    required: [true, 'Contact number is required'],
+    unique: true,
+    trim: true,
+    match: [/^[0-9]{10}$/, 'Please provide a valid 10-digit contact number'],
+  },
+  contactNumberVerified: {
+    type: Boolean,
+    default: false,
+  },
+  otp: {
+    code: String,
+    expiresAt: Date,
+  },
+  email: {
+    type: String,
+    // Removed unique constraint - email is optional and can be null
+    // Uniqueness will be checked in application logic when email is provided
+    lowercase: true,
+    trim: true,
+    match: [
+      /^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,3})+$/,
+      'Please add a valid email',
+    ],
+  },
+  gender: {
+    type: String,
+    enum: ['male', 'female', 'other'],
+  },
+  dateOfBirth: {
+    type: Date,
+  },
+  age: {
+    type: Number,
+  },
+  address: {
+    line1: String,
+    line2: String,
+    pinCode: {
+      type: String,
+      match: [/^[0-9]{6}$/, 'Please provide a valid 6-digit PIN code'],
+    },
+    city: String,
+    state: String,
+    latitude: Number,
+    longitude: Number,
+  },
+  addresses: [{
+    label: {
+      type: String,
+      trim: true,
+      default: 'Home',
+    },
+    type: {
+      type: String,
+      trim: true,
+      enum: ['home', 'work', 'other'],
+      default: 'home',
+    },
+    line1: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    line2: {
+      type: String,
+      trim: true,
+    },
+    pinCode: {
+      type: String,
+      required: true,
+      match: [/^[0-9]{6}$/, 'Please provide a valid 6-digit PIN code'],
+    },
+    city: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    state: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    latitude: {
+      type: Number,
+    },
+    longitude: {
+      type: Number,
+    },
+    isDefault: {
+      type: Boolean,
+      default: false,
+    },
+    createdAt: {
+      type: Date,
+      default: Date.now,
+    },
+  }],
+  profileImage: {
+    url: String,
+    publicId: String,
+  },
+  cashback: {
+    type: Number,
+    default: 0,
+    min: [0, 'Cashback cannot be negative'],
+  },
+  isActive: {
+    type: Boolean,
+    default: true,
+  },
+  fcmToken: {
+    type: String,
+    trim: true,
+  },
+  fcmTokens: [{
+    token: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    deviceId: {
+      type: String,
+      trim: true,
+    },
+    platform: {
+      type: String,
+      enum: ['android', 'ios', 'web'],
+    },
+    createdAt: {
+      type: Date,
+      default: Date.now,
+    },
+  }],
+  // Referral system
+  referralCode: {
+    type: String,
+    unique: true,
+    sparse: true,
+    trim: true,
+    uppercase: true,
+  },
+  referredBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null,
+  },
+  referralCount: {
+    type: Number,
+    default: 0,
+    min: [0, 'Referral count cannot be negative'],
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now,
+  },
+  updatedAt: {
+    type: Date,
+    default: Date.now,
+  },
+});
+
+UserSchema.pre('save', function (next) {
+  if (this.dateOfBirth) {
+    const today = new Date();
+    const birthDate = new Date(this.dateOfBirth);
+    let age = today.getFullYear() - birthDate.getFullYear();
+    const monthDiff = today.getMonth() - birthDate.getMonth();
+    if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
+      age--;
+    }
+    this.age = age;
+  }
+
+  // Ensure email is undefined (not null) if it's null or empty (to avoid index issues)
+  // Email is optional, so we set it to undefined to prevent MongoDB from indexing null values
+  if (this.email === null || this.email === '') {
+    delete this.email;
+  }
+
+  // Generate referral code if not exists (will be made unique by index)
+  if (!this.referralCode && this.isNew) {
+    // Generate referral code: USER + random string
+    const randomStr = Math.random().toString(36).substring(2, 8).toUpperCase();
+    this.referralCode = `USER${randomStr}`;
+  }
+
+  this.updatedAt = Date.now();
+  next();
+});
+
+UserSchema.methods.generateOTP = function () {
+  const otpCode = Math.floor(1000 + Math.random() * 9000).toString();
+
+  this.otp = {
+    code: otpCode,
+    expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+  };
+  return otpCode;
+};
+
+UserSchema.methods.verifyOTP = function (enteredOTP) {
+  if (!this.otp || !this.otp.code) {
+    return false;
+  }
+  if (this.otp.expiresAt < new Date()) {
+    return false;
+  }
+  return this.otp.code === enteredOTP;
+};
+
+UserSchema.methods.clearOTP = function () {
+  this.otp = undefined;
+};
+
+UserSchema.methods.getSignedJwtToken = function () {
+  if (!process.env.JWT_SECRET) {
+    throw new Error('JWT_SECRET is not configured. Please set JWT_SECRET in environment variables.');
+  }
+  return jwt.sign({ id: this._id, role: 'user' }, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_EXPIRE || '7d',
+  });
+};
+
+module.exports = mongoose.model('User', UserSchema);
+
+
+
+
+

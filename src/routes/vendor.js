@@ -1,0 +1,1234 @@
+const express = require('express');
+const { body, query, param } = require('express-validator');
+const { sendOTP, verifyOTP } = require('../controllers/vendorOTP');
+const { vendorLogout } = require('../controllers/vendorAuth');
+const { createVendor, getVendors, getVendor, updateVendorPermissions, updateVendorDocuments, updateVendorRadius, updateVendorHandlingCharge, suspendVendor, deleteVendor, getVendorOrders, getVendorOrderById, updateOrderStatus, assignRiderToOrder, updateVendorProfile, getVendorProfile, getVendorDashboardForAdmin, sendEarningWalletAmount, getMyWithdrawalRequests, getVendorCommission, updateVendorCommission, updateVendorByAdmin } = require('../controllers/vendor');
+const { addItemsToOrder, cancelOrderByVendor } = require('../controllers/checkout');
+const { getVendorProducts } = require('../controllers/productGet');
+const { createJobPost, getJobPosts, getJobPost, updateJobPost, deleteJobPost, toggleJobPostStatus, getMyJobPosts } = require('../controllers/riderJobPost');
+const { getAllVendorApplications, getJobApplications, reviewApplication, assignRider, getAssignedRiders, getApplication } = require('../controllers/riderJobApplication');
+const { getRidersDueAmounts, updateRiderDueAmount } = require('../controllers/rider');
+const { updateInventory, getInventory, getAllInventory } = require('../controllers/inventory');
+const { toggleProductOffer, getVendorOffers, getProductOffer } = require('../controllers/productOffer');
+const { protect } = require('../middleware/adminAuth');
+const { protectVendorOrAdmin } = require('../middleware/vendorOrAdminAuth');
+const { protect: protectVendor } = require('../middleware/vendorAuth');
+const { uploadFields } = require('../middleware/upload');
+const { createVendorTicket, getVendorTickets, getVendorTicket, addVendorTicketMessage } = require('../controllers/ticket');
+const { getVendorNotifications, markNotificationAsRead, markAllNotificationsAsRead, deleteNotification, deleteAllNotifications, getUnreadCount } = require('../controllers/notification');
+
+const router = express.Router();
+
+router.post(
+  '/send-otp',
+  [
+    body('contactNumber')
+      .trim()
+      .notEmpty()
+      .withMessage('Contact number is required')
+      .matches(/^[0-9]{10}$/)
+      .withMessage('Please provide a valid 10-digit contact number'),
+  ],
+  sendOTP
+);
+
+router.post(
+  '/verify-otp',
+  [
+    body('contactNumber')
+      .trim()
+      .notEmpty()
+      .withMessage('Contact number is required')
+      .matches(/^[0-9]{10}$/)
+      .withMessage('Please provide a valid 10-digit contact number'),
+    body('otp')
+      .trim()
+      .notEmpty()
+      .withMessage('OTP is required')
+      .matches(/^[0-9]{4}$/)
+      .withMessage('OTP must be a 4-digit number'),
+  ],
+  verifyOTP
+);
+
+const normalizeBodyFields = (req, res, next) => {
+  if (req.body) {
+    const normalizedBody = {};
+    for (const [key, value] of Object.entries(req.body)) {
+      const normalizedKey = key.trim();
+      if (!normalizedBody[normalizedKey] || normalizedKey === key) {
+        normalizedBody[normalizedKey] = value;
+      }
+    }
+    req.body = normalizedBody;
+  }
+  next();
+};
+
+router.post(
+  '/create',
+  protect,
+  normalizeBodyFields,
+  uploadFields,
+  [
+    body('vendorName')
+      .trim()
+      .notEmpty()
+      .withMessage('Vendor name is required')
+      .bail(),
+    body('contactNumber')
+      .trim()
+      .notEmpty()
+      .withMessage('Contact number is required')
+      .bail()
+      .matches(/^[0-9]{10}$/)
+      .withMessage('Please provide a valid 10-digit contact number'),
+    body('email')
+      .trim()
+      .notEmpty()
+      .withMessage('Email is required')
+      .bail()
+      .isEmail()
+      .withMessage('Please provide a valid email'),
+    body('gender')
+      .trim()
+      .notEmpty()
+      .withMessage('Gender is required')
+      .bail()
+      .isIn(['male', 'female', 'other'])
+      .withMessage('Gender must be male, female, or other'),
+    body('dateOfBirth')
+      .notEmpty()
+      .withMessage('Date of birth is required')
+      .bail()
+      .isISO8601()
+      .withMessage('Please provide a valid date'),
+    body('storeName')
+      .trim()
+      .notEmpty()
+      .withMessage('Store name is required')
+      .bail(),
+    body('storeAddressLine1')
+      .trim()
+      .notEmpty()
+      .withMessage('Store address line 1 is required')
+      .bail(),
+    body('pinCode')
+      .trim()
+      .notEmpty()
+      .withMessage('PIN code is required')
+      .bail()
+      .matches(/^[0-9]{6}$/)
+      .withMessage('Please provide a valid 6-digit PIN code'),
+    body('city')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('City cannot be empty if provided'),
+    body('state')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('State cannot be empty if provided'),
+    body('ifsc')
+      .trim()
+      .notEmpty()
+      .withMessage('IFSC code is required')
+      .bail()
+      .matches(/^[A-Z]{4}0[A-Z0-9]{6}$/)
+      .withMessage('Please provide a valid IFSC code'),
+    body('accountNumber')
+      .trim()
+      .notEmpty()
+      .withMessage('Account number is required')
+      .bail(),
+    body('bankName')
+      .optional()
+      .trim(),
+    body('bank_name')
+      .optional()
+      .trim(),
+    body('serviceRadius')
+      .optional()
+      .isFloat({ min: 0.1 })
+      .withMessage('Service radius must be a number greater than or equal to 0.1 km'),
+    body('handlingChargePercentage')
+      .optional()
+      .isFloat({ min: 0, max: 100 })
+      .withMessage('Handling charge percentage must be between 0 and 100'),
+    body().custom((value, { req }) => {
+      const bankName = (req.body.bankName || req.body.bank_name || '').trim();
+      if (!bankName) {
+        throw new Error('Bank name is required');
+      }
+      return true;
+    }),
+  ],
+  createVendor
+);
+
+router.get(
+  '/',
+  protect,
+  [
+    query('page')
+      .optional()
+      .isInt({ min: 1 })
+      .withMessage('Page must be a positive integer'),
+    query('limit')
+      .optional()
+      .isInt({ min: 1, max: 100 })
+      .withMessage('Limit must be between 1 and 100'),
+    query('search')
+      .optional()
+      .trim()
+      .isLength({ max: 200 })
+      .withMessage('Search query cannot exceed 200 characters'),
+  ],
+  getVendors
+);
+
+router.get('/orders', protectVendor, getVendorOrders);
+
+router.put(
+  '/orders/:id/status',
+  protectVendor,
+  [
+    body('status')
+      .notEmpty()
+      .withMessage('Status is required')
+      .bail()
+      .isIn(['pending', 'confirmed', 'processing', 'ready', 'rider_assign', 'out_for_delivery', 'delivered', 'cancelled', 'refunded'])
+      .withMessage('Invalid status'),
+    body('notes')
+      .optional()
+      .trim()
+      .isLength({ max: 1000 })
+      .withMessage('Notes cannot be more than 1000 characters'),
+    // Note: deliveryAmount is now automatically calculated at order creation based on distance
+    // No manual deliveryAmount input required
+  ],
+  updateOrderStatus
+);
+
+router.put(
+  '/orders/:orderId/cancel',
+  protectVendor,
+  [
+    param('orderId')
+      .notEmpty()
+      .withMessage('Order ID is required')
+      .bail()
+      .isMongoId()
+      .withMessage('Invalid order ID'),
+    body('reason')
+      .optional()
+      .trim()
+      .isLength({ max: 500 })
+      .withMessage('Cancellation reason cannot be more than 500 characters'),
+  ],
+  cancelOrderByVendor
+);
+
+router.put(
+  '/orders/:orderId/assign-rider',
+  protectVendor,
+  [
+    body('riderId')
+      .notEmpty()
+      .withMessage('Rider ID is required')
+      .bail()
+      .isMongoId()
+      .withMessage('Invalid rider ID format'),
+    body('assignmentNotes')
+      .optional()
+      .trim()
+      .isLength({ max: 1000 })
+      .withMessage('Assignment notes cannot be more than 1000 characters'),
+    body('updateStatus')
+      .optional()
+      .isBoolean()
+      .withMessage('updateStatus must be a boolean'),
+  ],
+  assignRiderToOrder
+);
+
+router.get('/orders/:id', protectVendor, getVendorOrderById);
+
+router.post(
+  '/order/:orderId/items',
+  protectVendor,
+  [
+    body('items')
+      .isArray({ min: 1 })
+      .withMessage('Items must be a non-empty array'),
+    body('items.*.productId')
+      .notEmpty()
+      .withMessage('Product ID is required for each item')
+      .bail()
+      .isMongoId()
+      .withMessage('Invalid product ID'),
+    body('items.*.quantity')
+      .notEmpty()
+      .withMessage('Quantity is required for each item')
+      .bail()
+      .isInt({ min: 1 })
+      .withMessage('Quantity must be a positive integer'),
+    body('items.*.sku')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('SKU cannot be empty if provided'),
+  ],
+  addItemsToOrder
+);
+
+router.get('/products', protectVendor, getVendorProducts);
+
+// Get vendor's own job posts (vendor ID extracted from token)
+router.get(
+  '/my-job-posts',
+  protectVendor,
+  [
+    query('page')
+      .optional()
+      .isInt({ min: 1 })
+      .withMessage('Page must be a positive integer'),
+    query('limit')
+      .optional()
+      .isInt({ min: 1, max: 100 })
+      .withMessage('Limit must be between 1 and 100'),
+    query('isActive')
+      .optional()
+      .isIn(['true', 'false'])
+      .withMessage('isActive must be either "true" or "false"'),
+    query('search')
+      .optional()
+      .trim()
+      .isLength({ max: 200 })
+      .withMessage('Search query cannot exceed 200 characters'),
+    query('city')
+      .optional()
+      .trim()
+      .isLength({ max: 100 })
+      .withMessage('City cannot exceed 100 characters'),
+    query('state')
+      .optional()
+      .trim()
+      .isLength({ max: 100 })
+      .withMessage('State cannot exceed 100 characters'),
+    query('pinCode')
+      .optional()
+      .trim()
+      .matches(/^[0-9]{6}$/)
+      .withMessage('PIN code must be a valid 6-digit number'),
+  ],
+  getMyJobPosts
+);
+
+router.post(
+  '/job-posts/create',
+  protectVendor,
+  [
+    body('jobTitle')
+      .trim()
+      .notEmpty()
+      .withMessage('Job title is required')
+      .isLength({ max: 200 })
+      .withMessage('Job title cannot be more than 200 characters'),
+    body('joiningBonus')
+      .notEmpty()
+      .withMessage('Joining bonus is required')
+      .isFloat({ min: 0 })
+      .withMessage('Joining bonus must be a number greater than or equal to 0'),
+    body('onboardingFee')
+      .notEmpty()
+      .withMessage('Onboarding fee is required')
+      .isFloat({ min: 0 })
+      .withMessage('Onboarding fee must be a number greater than or equal to 0'),
+    body('locationLine1')
+      .trim()
+      .notEmpty()
+      .withMessage('Location address line 1 is required'),
+    body('locationPinCode')
+      .trim()
+      .notEmpty()
+      .withMessage('PIN code is required')
+      .matches(/^[0-9]{6}$/)
+      .withMessage('Please provide a valid 6-digit PIN code'),
+    body('locationLine2')
+      .optional()
+      .trim(),
+    body('locationCity')
+      .optional()
+      .trim(),
+    body('locationState')
+      .optional()
+      .trim(),
+    body('locationLatitude')
+      .optional()
+      .isFloat()
+      .withMessage('Latitude must be a valid number'),
+    body('locationLongitude')
+      .optional()
+      .isFloat()
+      .withMessage('Longitude must be a valid number'),
+  ],
+  createJobPost
+);
+
+router.get('/job-posts', protectVendor, getJobPosts);
+
+router.get('/job-posts/:id', protectVendor, getJobPost);
+
+router.put(
+  '/job-posts/:id',
+  protectVendor,
+  [
+    body('jobTitle')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('Job title cannot be empty')
+      .isLength({ max: 200 })
+      .withMessage('Job title cannot be more than 200 characters'),
+    body('joiningBonus')
+      .optional()
+      .isFloat({ min: 0 })
+      .withMessage('Joining bonus must be a number greater than or equal to 0'),
+    body('onboardingFee')
+      .optional()
+      .isFloat({ min: 0 })
+      .withMessage('Onboarding fee must be a number greater than or equal to 0'),
+    body('locationLine1')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('Location address line 1 cannot be empty'),
+    body('locationPinCode')
+      .optional()
+      .trim()
+      .matches(/^[0-9]{6}$/)
+      .withMessage('Please provide a valid 6-digit PIN code'),
+    body('locationLine2')
+      .optional()
+      .trim(),
+    body('locationCity')
+      .optional()
+      .trim(),
+    body('locationState')
+      .optional()
+      .trim(),
+    body('locationLatitude')
+      .optional()
+      .isFloat()
+      .withMessage('Latitude must be a valid number'),
+    body('locationLongitude')
+      .optional()
+      .isFloat()
+      .withMessage('Longitude must be a valid number'),
+  ],
+  updateJobPost
+);
+
+router.delete('/job-posts/:id', protectVendor, deleteJobPost);
+
+router.patch('/job-posts/:id/toggle-status', protectVendor, toggleJobPostStatus);
+
+router.get('/job-applications', protectVendor, getAllVendorApplications);
+
+router.get('/job-posts/:jobPostId/applications', protectVendor, getJobApplications);
+
+router.get('/job-applications/:applicationId', protectVendor, getApplication);
+
+router.put(
+  '/job-applications/:applicationId/review',
+  protectVendor,
+  [
+    body('status')
+      .notEmpty()
+      .withMessage('Status is required')
+      .isIn(['approved', 'rejected'])
+      .withMessage('Status must be either "approved" or "rejected"'),
+    body('rejectionReason')
+      .optional()
+      .trim()
+      .isLength({ max: 500 })
+      .withMessage('Rejection reason cannot be more than 500 characters'),
+  ],
+  reviewApplication
+);
+
+router.put(
+  '/job-applications/:applicationId/assign',
+  protectVendor,
+  [
+    body('assignmentNotes')
+      .optional()
+      .trim()
+      .isLength({ max: 1000 })
+      .withMessage('Assignment notes cannot be more than 1000 characters'),
+  ],
+  assignRider
+);
+
+router.get('/job-posts/:jobPostId/assigned-riders', protectVendor, getAssignedRiders);
+
+// Get all riders' due amounts for vendor
+router.get(
+  '/riders/due-amounts',
+  protectVendor,
+  [
+    query('page')
+      .optional()
+      .isInt({ min: 1 })
+      .withMessage('Page must be a positive integer'),
+    query('limit')
+      .optional()
+      .isInt({ min: 1, max: 100 })
+      .withMessage('Limit must be between 1 and 100'),
+    query('isActive')
+      .optional()
+      .isIn(['true', 'false'])
+      .withMessage('isActive must be either "true" or "false"'),
+    query('approvalStatus')
+      .optional()
+      .isIn(['pending', 'approved', 'rejected'])
+      .withMessage('Invalid approval status'),
+  ],
+  getRidersDueAmounts
+);
+
+// Update rider due amount from vendor API
+// Deducts dueAmount + order's delivery charge from earningWallet
+// Also reduces dueBalance by dueAmount
+// Wallet can go negative
+router.put(
+  '/riders/:riderId/due-amount',
+  protectVendor,
+  [
+    param('riderId')
+      .notEmpty()
+      .withMessage('Rider ID is required')
+      .bail()
+      .isMongoId()
+      .withMessage('Invalid rider ID format'),
+    body('dueAmount')
+      .notEmpty()
+      .withMessage('Due amount (deduction amount) is required')
+      .bail()
+      .isFloat({ min: 0 })
+      .withMessage('Due amount (deduction amount) must be a number greater than or equal to 0'),
+    body('orderId')
+      .optional()
+      .isMongoId()
+      .withMessage('Order ID must be a valid MongoDB ObjectId'),
+    body('description')
+      .optional()
+      .trim()
+      .isLength({ max: 500 })
+      .withMessage('Description cannot exceed 500 characters'),
+  ],
+  updateRiderDueAmount
+);
+
+router.get(
+  '/inventory',
+  protectVendor,
+  [
+    query('page')
+      .optional()
+      .isInt({ min: 1 })
+      .withMessage('Page must be a positive integer'),
+    query('limit')
+      .optional()
+      .isInt({ min: 1, max: 100 })
+      .withMessage('Limit must be between 1 and 100'),
+    query('search')
+      .optional()
+      .trim()
+      .isLength({ max: 200 })
+      .withMessage('Search term cannot exceed 200 characters'),
+  ],
+  getAllInventory
+);
+
+router.get('/inventory/:id', protectVendor, getInventory);
+
+router.put(
+  '/inventory/:id',
+  protectVendor,
+  [
+    body('inventory')
+      .optional()
+      .isFloat({ min: 0 })
+      .withMessage('Inventory must be a number greater than or equal to 0'),
+    body('action')
+      .optional()
+      .isIn(['add', 'subtract', 'set'])
+      .withMessage('Action must be one of: add, subtract, set'),
+    body('skus')
+      .optional()
+      .isArray()
+      .withMessage('SKUs must be an array'),
+    body('skus.*.sku')
+      .if(body('skus').exists())
+      .trim()
+      .notEmpty()
+      .withMessage('Each SKU must have a valid sku string'),
+    body('skus.*.inventory')
+      .if(body('skus').exists())
+      .isFloat({ min: 0 })
+      .withMessage('Each SKU inventory must be a number greater than or equal to 0'),
+    body().custom((value, { req }) => {
+      if (!req.body.inventory && (!req.body.skus || !Array.isArray(req.body.skus) || req.body.skus.length === 0)) {
+        throw new Error('Either inventory or skus must be provided');
+      }
+      return true;
+    }),
+  ],
+  updateInventory
+);
+
+// Profile routes (protected - vendor can get and update their own profile)
+// Must be placed before /:id route to ensure proper matching
+router.get('/profile', protectVendor, getVendorProfile);
+
+router.put(
+  '/profile',
+  protectVendor,
+  uploadFields,
+  [
+    body('vendorName')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('Vendor name cannot be empty'),
+    body('altContactNumber')
+      .optional()
+      .trim()
+      .matches(/^[0-9]{10}$/)
+      .withMessage('Please provide a valid 10-digit contact number'),
+    body('email')
+      .optional()
+      .trim()
+      .isEmail()
+      .withMessage('Please provide a valid email'),
+    body('gender')
+      .optional()
+      .isIn(['male', 'female', 'other'])
+      .withMessage('Gender must be male, female, or other'),
+    body('dateOfBirth')
+      .optional()
+      .isISO8601()
+      .withMessage('Please provide a valid date'),
+    body('storeName')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('Store name cannot be empty'),
+    body('storeAddressLine1')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('Store address line 1 cannot be empty'),
+    body('storeAddressLine2')
+      .optional()
+      .trim(),
+    body('pinCode')
+      .optional()
+      .trim()
+      .matches(/^[0-9]{6}$/)
+      .withMessage('Please provide a valid 6-digit PIN code'),
+    body('latitude')
+      .optional()
+      .isFloat()
+      .withMessage('Latitude must be a valid number'),
+    body('longitude')
+      .optional()
+      .isFloat()
+      .withMessage('Longitude must be a valid number'),
+    body('ifsc')
+      .optional()
+      .trim()
+      .matches(/^[A-Z]{4}0[A-Z0-9]{6}$/)
+      .withMessage('Please provide a valid IFSC code'),
+    body('accountNumber')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('Account number cannot be empty'),
+    body('bankName')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('Bank name cannot be empty'),
+    body('bank_name')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('Bank name cannot be empty'),
+    body('serviceRadius')
+      .optional()
+      .isFloat({ min: 0.1 })
+      .withMessage('Service radius must be a number greater than or equal to 0.1 km'),
+    body('handlingChargePercentage')
+      .optional()
+      .isFloat({ min: 0, max: 100 })
+      .withMessage('Handling charge percentage must be between 0 and 100'),
+    body('fssaiNumber')
+      .optional()
+      .trim()
+      .matches(/^[0-9]{14,17}$/)
+      .withMessage('Please provide a valid FSSAI number (14-17 digits)'),
+    body('deliveryChargePerKm')
+      .optional()
+      .isFloat({ min: 0 })
+      .withMessage('Delivery charge per km must be a number greater than or equal to 0'),
+    body('contactNumber')
+      .custom((value) => {
+        if (value !== undefined) {
+          throw new Error('Contact number cannot be updated through this endpoint');
+        }
+        return true;
+      }),
+  ],
+  updateVendorProfile
+);
+
+// Notification routes (protected - vendor can manage their notifications)
+// Must be placed before /:id route to ensure proper matching
+router.get(
+  '/notifications',
+  protectVendor,
+  [
+    query('page')
+      .optional()
+      .isInt({ min: 1 })
+      .withMessage('Page must be a positive integer'),
+    query('limit')
+      .optional()
+      .isInt({ min: 1, max: 100 })
+      .withMessage('Limit must be between 1 and 100'),
+    query('isRead')
+      .optional()
+      .isIn(['true', 'false'])
+      .withMessage('isRead must be true or false'),
+    query('type')
+      .optional()
+      .isIn(['order_created', 'order_updated', 'order_cancelled', 'order_delivered', 'product_approved', 'product_rejected', 'invoice_generated', 'payment_received', 'general'])
+      .withMessage('Invalid notification type'),
+  ],
+  getVendorNotifications
+);
+
+router.get('/notifications/unread-count', protectVendor, getUnreadCount);
+
+router.put(
+  '/notifications/:notificationId/read',
+  protectVendor,
+  [
+    param('notificationId')
+      .notEmpty()
+      .withMessage('Notification ID is required')
+      .bail()
+      .isMongoId()
+      .withMessage('Invalid notification ID format'),
+  ],
+  markNotificationAsRead
+);
+
+router.put('/notifications/read-all', protectVendor, markAllNotificationsAsRead);
+
+router.delete(
+  '/notifications/:notificationId',
+  protectVendor,
+  [
+    param('notificationId')
+      .notEmpty()
+      .withMessage('Notification ID is required')
+      .bail()
+      .isMongoId()
+      .withMessage('Invalid notification ID format'),
+  ],
+  deleteNotification
+);
+
+router.delete('/notifications', protectVendor, deleteAllNotifications);
+
+// Ticket routes (protected - vendor can create and manage their tickets)
+// Must be placed before /:id route to ensure proper matching
+router.post(
+  '/tickets',
+  protectVendor,
+  [
+    body('complaint')
+      .trim()
+      .notEmpty()
+      .withMessage('Complaint is required')
+      .isLength({ min: 10, max: 2000 })
+      .withMessage('Complaint must be between 10 and 2000 characters'),
+    body('category')
+      .optional()
+      .isIn(['order_delivery', 'account_profile', 'payments_refunds', 'login_otp', 'general_queries'])
+      .withMessage('Invalid category. Must be one of: order_delivery, account_profile, payments_refunds, login_otp, general_queries'),
+    body('orderId')
+      .optional()
+      .isMongoId()
+      .withMessage('Invalid order ID format'),
+  ],
+  createVendorTicket
+);
+
+router.get(
+  '/tickets',
+  protectVendor,
+  [
+    query('page')
+      .optional()
+      .isInt({ min: 1 })
+      .withMessage('Page must be a positive integer'),
+    query('limit')
+      .optional()
+      .isInt({ min: 1, max: 100 })
+      .withMessage('Limit must be between 1 and 100'),
+    query('status')
+      .optional()
+      .isIn(['active', 'pending', 'resolved', 'closed'])
+      .withMessage('Invalid status. Must be one of: active, pending, resolved, closed'),
+    query('category')
+      .optional()
+      .isIn(['order_delivery', 'account_profile', 'payments_refunds', 'login_otp', 'general_queries'])
+      .withMessage('Invalid category. Must be one of: order_delivery, account_profile, payments_refunds, login_otp, general_queries'),
+  ],
+  getVendorTickets
+);
+
+router.get(
+  '/tickets/:ticketId',
+  protectVendor,
+  [
+    param('ticketId')
+      .notEmpty()
+      .withMessage('Ticket ID is required')
+      .bail()
+      .isMongoId()
+      .withMessage('Invalid ticket ID format'),
+  ],
+  getVendorTicket
+);
+
+router.post(
+  '/tickets/:ticketId/messages',
+  protectVendor,
+  [
+    param('ticketId')
+      .notEmpty()
+      .withMessage('Ticket ID is required')
+      .bail()
+      .isMongoId()
+      .withMessage('Invalid ticket ID format'),
+    body('message')
+      .trim()
+      .notEmpty()
+      .withMessage('Message is required')
+      .isLength({ min: 1, max: 2000 })
+      .withMessage('Message must be between 1 and 2000 characters'),
+  ],
+  addVendorTicketMessage
+);
+
+// Admin route to get vendor dashboard data
+router.get(
+  '/:id/dashboard',
+  protect,
+  [
+    param('id')
+      .notEmpty()
+      .withMessage('Vendor ID is required')
+      .bail()
+      .isMongoId()
+      .withMessage('Invalid vendor ID format'),
+  ],
+  getVendorDashboardForAdmin
+);
+
+router.get('/:id', protect, getVendor);
+
+router.put(
+  '/:id',
+  protect,
+  uploadFields,
+  [
+    body('vendorName')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('Vendor name cannot be empty'),
+    body('altContactNumber')
+      .optional()
+      .trim()
+      .matches(/^[0-9]{10}$/)
+      .withMessage('Please provide a valid 10-digit alternate contact number'),
+    body('email')
+      .optional()
+      .trim()
+      .isEmail()
+      .withMessage('Please provide a valid email'),
+    body('gender')
+      .optional()
+      .isIn(['male', 'female', 'other'])
+      .withMessage('Gender must be male, female, or other'),
+    body('dateOfBirth')
+      .optional()
+      .isISO8601()
+      .withMessage('Please provide a valid date'),
+    body('storeName')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('Store name cannot be empty'),
+    body('storeAddressLine1')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('Store address line 1 cannot be empty'),
+    body('storeAddressLine2')
+      .optional()
+      .trim(),
+    body('pinCode')
+      .optional()
+      .trim()
+      .matches(/^[0-9]{6}$/)
+      .withMessage('Please provide a valid 6-digit PIN code'),
+    body('city')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('City cannot be empty if provided'),
+    body('state')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('State cannot be empty if provided'),
+    body('latitude')
+      .optional()
+      .isFloat()
+      .withMessage('Latitude must be a valid number'),
+    body('longitude')
+      .optional()
+      .isFloat()
+      .withMessage('Longitude must be a valid number'),
+    body('ifsc')
+      .optional()
+      .trim()
+      .matches(/^[A-Z]{4}0[A-Z0-9]{6}$/)
+      .withMessage('Please provide a valid IFSC code'),
+    body('accountNumber')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('Account number cannot be empty'),
+    body('bankName')
+      .optional()
+      .trim(),
+    body('bank_name')
+      .optional()
+      .trim(),
+    body('serviceRadius')
+      .optional()
+      .isFloat({ min: 0.1 })
+      .withMessage('Service radius must be a number greater than or equal to 0.1 km'),
+    body('handlingChargePercentage')
+      .optional()
+      .isFloat({ min: 0, max: 100 })
+      .withMessage('Handling charge percentage must be between 0 and 100'),
+    body('fssaiNumber')
+      .optional()
+      .trim()
+      .matches(/^[0-9]{14,17}$/)
+      .withMessage('Please provide a valid FSSAI number (14-17 digits)'),
+    body('deliveryChargePerKm')
+      .optional()
+      .isFloat({ min: 0 })
+      .withMessage('Delivery charge per km must be a number greater than or equal to 0'),
+  ],
+  updateVendorByAdmin
+);
+
+router.put(
+  '/:id/permissions',
+  protect,
+  [
+    body('permissions')
+      .optional()
+      .custom((value) => {
+        if (typeof value === 'string') {
+          try {
+            JSON.parse(value);
+            return true;
+          } catch {
+            return false;
+          }
+        }
+        return typeof value === 'object';
+      })
+      .withMessage('Permissions must be a valid JSON object'),
+  ],
+  updateVendorPermissions
+);
+
+router.put(
+  '/:id/documents',
+  protect,
+  uploadFields,
+  updateVendorDocuments
+);
+
+router.put(
+  '/:id/radius',
+  protectVendorOrAdmin,
+  [
+    body('serviceRadius')
+      .notEmpty()
+      .withMessage('Service radius is required')
+      .bail()
+      .isFloat({ min: 0.1 })
+      .withMessage('Service radius must be a number greater than or equal to 0.1 km'),
+  ],
+  updateVendorRadius
+);
+
+router.put(
+  '/:id/handling-charge',
+  protectVendorOrAdmin,
+  [
+    body('handlingChargePercentage')
+      .notEmpty()
+      .withMessage('Handling charge percentage is required')
+      .bail()
+      .isFloat({ min: 0, max: 100 })
+      .withMessage('Handling charge percentage must be between 0 and 100'),
+  ],
+  updateVendorHandlingCharge
+);
+
+router.put('/:id/suspend', protect, suspendVendor);
+
+// Commission Management Routes
+router.get(
+  '/:id/commission',
+  protect,
+  [
+    param('id')
+      .notEmpty()
+      .withMessage('Vendor ID is required')
+      .bail()
+      .isMongoId()
+      .withMessage('Invalid vendor ID format'),
+  ],
+  getVendorCommission
+);
+
+router.put(
+  '/:id/commission',
+  protect,
+  [
+    param('id')
+      .notEmpty()
+      .withMessage('Vendor ID is required')
+      .bail()
+      .isMongoId()
+      .withMessage('Invalid vendor ID format'),
+    body('type')
+      .optional()
+      .isIn(['percentage', 'fixed', 'hybrid', 'subscription'])
+      .withMessage('Commission type must be one of: percentage, fixed, hybrid, subscription'),
+    body('percentage')
+      .optional()
+      .isFloat({ min: 0, max: 100 })
+      .withMessage('Commission percentage must be between 0 and 100'),
+    body('fixedAmount')
+      .optional()
+      .isFloat({ min: 0 })
+      .withMessage('Fixed commission amount must be greater than or equal to 0'),
+    body('subscriptionAmount')
+      .optional()
+      .isFloat({ min: 0 })
+      .withMessage('Subscription amount must be greater than or equal to 0'),
+    body('subscriptionPeriod')
+      .optional()
+      .isIn(['monthly', 'yearly'])
+      .withMessage('Subscription period must be either monthly or yearly'),
+  ],
+  updateVendorCommission
+);
+
+router.delete('/:id', protect, deleteVendor);
+
+// Product Offer Routes
+router.put(
+  '/products/:productId/offer',
+  protectVendor,
+  [
+    body('offerEnabled')
+      .optional()
+      .isBoolean()
+      .withMessage('offerEnabled must be a boolean'),
+    body('offerDiscountPercentage')
+      .optional()
+      .isFloat({ min: 0, max: 100 })
+      .withMessage('Discount percentage must be between 0 and 100'),
+    body('offerStartDate')
+      .optional()
+      .custom((value) => {
+        if (value === null || value === '') return true;
+        const date = new Date(value);
+        return !isNaN(date.getTime());
+      })
+      .withMessage('Start date must be a valid date (ISO8601 or YYYY-MM-DD)'),
+    body('offerStartTime')
+      .optional()
+      .matches(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$/)
+      .withMessage('Start time must be in HH:MM or HH:MM:SS format (24-hour)'),
+    body('offerEndDate')
+      .optional()
+      .custom((value) => {
+        if (value === null || value === '') return true;
+        const date = new Date(value);
+        return !isNaN(date.getTime());
+      })
+      .withMessage('End date must be a valid date (ISO8601 or YYYY-MM-DD)'),
+    body('offerEndTime')
+      .optional()
+      .matches(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$/)
+      .withMessage('End time must be in HH:MM or HH:MM:SS format (24-hour)'),
+    body('isDailyOffer')
+      .optional()
+      .isBoolean()
+      .withMessage('isDailyOffer must be a boolean'),
+  ],
+  toggleProductOffer
+);
+
+router.get(
+  '/products/offers',
+  protectVendor,
+  [
+    query('page')
+      .optional()
+      .isInt({ min: 1 })
+      .withMessage('Page must be a positive integer'),
+    query('limit')
+      .optional()
+      .isInt({ min: 1, max: 100 })
+      .withMessage('Limit must be between 1 and 100'),
+    query('status')
+      .optional()
+      .isIn(['all', 'active', 'upcoming', 'expired', 'enabled'])
+      .withMessage('Status must be one of: all, active, upcoming, expired, enabled'),
+  ],
+  getVendorOffers
+);
+
+router.get('/products/:productId/offer', protectVendor, getProductOffer);
+
+// Update daily offer (Vendor only - can only update their own products)
+router.put(
+  '/daily-offers/:productId',
+  protectVendor,
+  [
+    param('productId')
+      .notEmpty()
+      .withMessage('Product ID is required')
+      .bail()
+      .isMongoId()
+      .withMessage('Product ID must be a valid MongoDB ObjectId'),
+    body('offerEnabled')
+      .optional()
+      .isBoolean()
+      .withMessage('offerEnabled must be a boolean'),
+    body('offerDiscountPercentage')
+      .optional()
+      .isFloat({ min: 0, max: 100 })
+      .withMessage('Discount percentage must be between 0 and 100'),
+    body('offerStartDate')
+      .optional()
+      .custom((value) => {
+        if (value === null || value === '') return true;
+        const date = new Date(value);
+        return !isNaN(date.getTime());
+      })
+      .withMessage('Start date must be a valid date (ISO8601 or YYYY-MM-DD)'),
+    body('offerStartTime')
+      .optional()
+      .matches(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$/)
+      .withMessage('Start time must be in HH:MM or HH:MM:SS format (24-hour)'),
+    body('offerEndDate')
+      .optional()
+      .custom((value) => {
+        if (value === null || value === '') return true;
+        const date = new Date(value);
+        return !isNaN(date.getTime());
+      })
+      .withMessage('End date must be a valid date (ISO8601 or YYYY-MM-DD)'),
+    body('offerEndTime')
+      .optional()
+      .matches(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$/)
+      .withMessage('End time must be in HH:MM or HH:MM:SS format (24-hour)'),
+    body('isDailyOffer')
+      .optional()
+      .isBoolean()
+      .withMessage('isDailyOffer must be a boolean'),
+  ],
+  toggleProductOffer
+);
+
+// ============ VENDOR EARNING WALLET WITHDRAWAL ROUTES ============
+
+// Send/Transfer amount from vendor's earningWallet (creates withdrawal request)
+router.post(
+  '/wallet/earning/send',
+  protectVendor,
+  [
+    body('amount')
+      .notEmpty()
+      .withMessage('Amount is required')
+      .bail()
+      .isFloat({ min: 0.01 })
+      .withMessage('Amount must be a positive number greater than 0'),
+    body('description')
+      .optional()
+      .trim()
+      .isLength({ max: 500 })
+      .withMessage('Description cannot be more than 500 characters'),
+  ],
+  sendEarningWalletAmount
+);
+
+// Get vendor's own withdrawal requests
+router.get(
+  '/wallet/earning/withdrawal-requests',
+  protectVendor,
+  [
+    query('page')
+      .optional()
+      .isInt({ min: 1 })
+      .withMessage('Page must be a positive integer'),
+    query('limit')
+      .optional()
+      .isInt({ min: 1, max: 100 })
+      .withMessage('Limit must be between 1 and 100'),
+    query('status')
+      .optional()
+      .isIn(['pending', 'approved', 'rejected'])
+      .withMessage('Status must be pending, approved, or rejected'),
+  ],
+  getMyWithdrawalRequests
+);
+
+// Logout route (protected)
+router.post('/logout', protectVendor, vendorLogout);
+
+module.exports = router;
+

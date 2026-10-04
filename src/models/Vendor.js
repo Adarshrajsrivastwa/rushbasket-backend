@@ -1,0 +1,469 @@
+const mongoose = require('mongoose');
+const jwt = require('jsonwebtoken');
+
+const VendorSchema = new mongoose.Schema({
+  vendorName: {
+    type: String,
+    required: function() {
+      return !!this.storeId;
+    },
+    trim: true,
+  },
+  contactNumber: {
+    type: String,
+    required: [true, 'Contact number is required'],
+    unique: true,
+    trim: true,
+    match: [/^[0-9]{10}$/, 'Please provide a valid 10-digit contact number'],
+  },
+  contactNumberVerified: {
+    type: Boolean,
+    default: false,
+  },
+  otp: {
+    code: String,
+    expiresAt: Date,
+  },
+  altContactNumber: {
+    type: String,
+    trim: true,
+    match: [/^[0-9]{10}$/, 'Please provide a valid 10-digit contact number'],
+  },
+  email: {
+    type: String,
+    required: function() {
+      return !!this.storeId;
+    },
+    unique: true,
+    sparse: true,
+    lowercase: true,
+    match: [
+      /^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,3})+$/,
+      'Please add a valid email',
+    ],
+  },
+  gender: {
+    type: String,
+    enum: ['male', 'female', 'other'],
+    required: function() {
+      return !!this.storeId;
+    },
+  },
+  dateOfBirth: {
+    type: Date,
+    required: function() {
+      return !!this.storeId;
+    },
+  },
+  age: {
+    type: Number,
+  },
+  profileImage: {
+    url: String,
+    publicId: String,
+  },
+  storeId: {
+    type: String,
+    unique: true,
+    sparse: true,
+    index: true,
+  },
+  storeName: {
+    type: String,
+    required: function() {
+      return !!this.storeId;
+    },
+    trim: true,
+  },
+  storeImage: [{
+    url: String,
+    publicId: String,
+  }],
+  storeAddress: {
+    line1: {
+      type: String,
+      required: function() {
+        return !!this.storeId;
+      },
+    },
+    line2: String,
+    pinCode: {
+      type: String,
+      required: function() {
+        return !!this.storeId;
+      },
+      match: [/^[0-9]{6}$/, 'Please provide a valid 6-digit PIN code'],
+    },
+    city: {
+      type: String,
+      required: function() {
+        return !!this.storeId;
+      },
+    },
+    state: {
+      type: String,
+      required: function() {
+        return !!this.storeId;
+      },
+    },
+    latitude: Number,
+    longitude: Number,
+  },
+  documents: {
+    panCardFront: {
+      url: String,
+      publicId: String,
+    },
+    panCardBack: {
+      url: String,
+      publicId: String,
+    },
+    aadharCardFront: {
+      url: String,
+      publicId: String,
+    },
+    aadharCardBack: {
+      url: String,
+      publicId: String,
+    },
+    drivingLicense: {
+      url: String,
+      publicId: String,
+    },
+  },
+  bankDetails: {
+    ifsc: {
+      type: String,
+      required: function() {
+        return !!this.storeId;
+      },
+      trim: true,
+      uppercase: true,
+    },
+    accountNumber: {
+      type: String,
+      required: function() {
+        return !!this.storeId;
+      },
+      trim: true,
+    },
+    bankName: {
+      type: String,
+      required: function() {
+        return !!this.storeId;
+      },
+      trim: true,
+    },
+    cancelCheque: {
+      url: String,
+      publicId: String,
+    },
+  },
+  fssaiNumber: {
+    type: String,
+    trim: true,
+    match: [/^[0-9]{14,17}$/, 'Please provide a valid FSSAI number (14-17 digits)'],
+  },
+  permissions: {
+    canManageProducts: {
+      type: Boolean,
+      default: false,
+    },
+    canManageOrders: {
+      type: Boolean,
+      default: false,
+    },
+    canManageInventory: {
+      type: Boolean,
+      default: false,
+    },
+    canViewAnalytics: {
+      type: Boolean,
+      default: false,
+    },
+    canManageDiscounts: {
+      type: Boolean,
+      default: false,
+    },
+    canManagePromotions: {
+      type: Boolean,
+      default: false,
+    },
+    canExportData: {
+      type: Boolean,
+      default: false,
+    },
+    canManageReviews: {
+      type: Boolean,
+      default: false,
+    },
+  },
+  isActive: {
+    type: Boolean,
+    default: true,
+  },
+  serviceRadius: {
+    type: Number,
+    default: 5,
+    min: [0.1, 'Service radius must be at least 0.1 km'],
+    required: function() {
+      return !!this.storeId;
+    },
+  },
+  handlingChargePercentage: {
+    type: Number,
+    default: 0,
+    min: [0, 'Handling charge percentage must be greater than or equal to 0'],
+    max: [100, 'Handling charge percentage cannot exceed 100'],
+  },
+  deliveryChargePerKm: {
+    type: Number,
+    default: 0,
+    min: [0, 'Delivery charge per km must be greater than or equal to 0'],
+  },
+  // Commission System - Vendor-wise commission settings
+  commission: {
+    type: {
+      type: String,
+      enum: ['percentage', 'fixed', 'hybrid', 'subscription'],
+      default: 'percentage',
+    },
+    percentage: {
+      type: Number,
+      default: 10,
+      min: [0, 'Commission percentage must be greater than or equal to 0'],
+      max: [100, 'Commission percentage cannot exceed 100'],
+    },
+    fixedAmount: {
+      type: Number,
+      default: 0,
+      min: [0, 'Fixed commission amount must be greater than or equal to 0'],
+    },
+    subscriptionAmount: {
+      type: Number,
+      default: 0,
+      min: [0, 'Subscription amount must be greater than or equal to 0'],
+    },
+    subscriptionPeriod: {
+      type: String,
+      enum: ['monthly', 'yearly'],
+      default: 'monthly',
+    },
+    subscriptionDeductionDate: {
+      type: Number, // Day of month (1-31) for monthly, day of year (1-365) for yearly
+      default: null,
+    },
+    lastSubscriptionDeduction: {
+      type: Date,
+      default: null,
+    },
+    nextSubscriptionDeduction: {
+      type: Date,
+      default: null,
+    },
+    updatedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Admin',
+    },
+    updatedAt: {
+      type: Date,
+      default: Date.now,
+    },
+  },
+  revenue: {
+    type: Map,
+    of: Number,
+    default: {},
+  },
+  earningWallet: {
+    type: Number,
+    default: 0,
+    // Note: Wallet can go negative for subscription commissions
+  },
+  walletTransactions: [{
+    type: {
+      type: String,
+      enum: ['credit', 'debit', 'reset'],
+      required: true,
+    },
+    amount: {
+      type: Number,
+      required: true,
+      min: [0, 'Amount must be greater than or equal to 0'],
+    },
+    orderId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Order',
+    },
+    orderNumber: {
+      type: String,
+    },
+    description: {
+      type: String,
+      trim: true,
+    },
+    createdAt: {
+      type: Date,
+      default: Date.now,
+    },
+  }],
+  productSales: [{
+    product: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Product',
+      required: true,
+    },
+    productName: {
+      type: String,
+      required: true,
+    },
+    month: {
+      type: String,
+      required: true,
+      match: [/^\d{4}-\d{2}$/, 'Month must be in YYYY-MM format'],
+    },
+    quantity: {
+      type: Number,
+      required: true,
+      min: [0, 'Quantity must be greater than or equal to 0'],
+    },
+    revenue: {
+      type: Number,
+      required: true,
+      min: [0, 'Revenue must be greater than or equal to 0'],
+    },
+    orderId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Order',
+    },
+    orderNumber: {
+      type: String,
+    },
+    createdAt: {
+      type: Date,
+      default: Date.now,
+    },
+  }],
+  createdBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Admin',
+    required: function() {
+      return !!this.storeId;
+    },
+  },
+  fcmToken: {
+    type: String,
+    trim: true,
+  },
+  fcmTokens: [{
+    token: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    deviceId: {
+      type: String,
+      trim: true,
+    },
+    platform: {
+      type: String,
+      enum: ['android', 'ios', 'web'],
+    },
+    createdAt: {
+      type: Date,
+      default: Date.now,
+    },
+  }],
+  createdAt: {
+    type: Date,
+    default: Date.now,
+  },
+  updatedAt: {
+    type: Date,
+    default: Date.now,
+  },
+});
+
+VendorSchema.pre('save', function (next) {
+  if (this.dateOfBirth) {
+    const today = new Date();
+    const birthDate = new Date(this.dateOfBirth);
+    let age = today.getFullYear() - birthDate.getFullYear();
+    const monthDiff = today.getMonth() - birthDate.getMonth();
+    if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
+      age--;
+    }
+    this.age = age;
+  }
+  this.updatedAt = Date.now();
+  next();
+});
+
+VendorSchema.methods.generateOTP = function () {
+  const otpCode = Math.floor(1000 + Math.random() * 9000).toString();
+  this.otp = {
+    code: otpCode,
+    expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+  };
+  return otpCode;
+};
+
+VendorSchema.methods.verifyOTP = function (enteredOTP) {
+  if (!this.otp || !this.otp.code) {
+    return false;
+  }
+  if (this.otp.expiresAt < new Date()) {
+    return false;
+  }
+  return this.otp.code === enteredOTP;
+};
+
+VendorSchema.methods.clearOTP = function () {
+  this.otp = undefined;
+};
+
+VendorSchema.methods.getSignedJwtToken = function () {
+  if (!process.env.JWT_SECRET) {
+    throw new Error('JWT_SECRET is not configured. Please set JWT_SECRET in environment variables.');
+  }
+  return jwt.sign({ id: this._id, role: 'vendor' }, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_EXPIRE || '7d',
+  });
+};
+
+VendorSchema.statics.generateStoreId = async function () {
+  let storeId;
+  let exists = true;
+  let attempts = 0;
+  const maxAttempts = 10;
+  
+  while (exists && attempts < maxAttempts) {
+    const randomNum = Math.floor(100000 + Math.random() * 900000);
+    storeId = `RB${randomNum}`;
+    const vendor = await this.findOne({ storeId });
+    if (!vendor) {
+      exists = false;
+    }
+    attempts++;
+  }
+  
+  if (exists) {
+    throw new Error('Failed to generate unique store ID after multiple attempts');
+  }
+  
+  return storeId;
+};
+
+// Create partial unique index for storeId (only for non-null values)
+// This prevents duplicate null issues
+VendorSchema.index(
+  { storeId: 1 },
+  { 
+    unique: true, 
+    sparse: true,
+    partialFilterExpression: { storeId: { $exists: true, $ne: null } }
+  }
+);
+
+module.exports = mongoose.model('Vendor', VendorSchema);
+

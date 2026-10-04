@@ -1,0 +1,484 @@
+const Vendor = require('../models/Vendor');
+const { uploadToCloudinary } = require('../utils/cloudinary');
+const { getPostOfficeDetails } = require('../utils/postOfficeAPI');
+const logger = require('../utils/logger');
+
+const uploadVendorFiles = async (files) => {
+  const uploadPromises = [];
+
+  // Safety check: ensure files is defined
+  if (!files || typeof files !== 'object') {
+    return {};
+  }
+
+  const storeImages = files.storeImage || files['storeImage '] || files[' storeImage'] || files['storeImage[]'] || files['storeImage[] '] || files[' storeImage[]'] || [];
+  if (storeImages.length > 0) {
+    storeImages.forEach((file) => {
+      uploadPromises.push(
+        uploadToCloudinary(file, 'rush-basket/store-images').then(
+          (result) => ({ field: 'storeImage', result })
+        )
+      );
+    });
+  }
+
+  const panCardFrontFile = files.panCardFront || files['panCardFront '] || files[' panCardFront'];
+  if (panCardFrontFile && panCardFrontFile[0]) {
+    uploadPromises.push(
+      uploadToCloudinary(panCardFrontFile[0], 'rush-basket/documents/pan').then(
+        (result) => ({ field: 'panCardFront', result })
+      )
+    );
+  }
+
+  const panCardBackFile = files.panCardBack || files['panCardBack '] || files[' panCardBack'];
+  if (panCardBackFile && panCardBackFile[0]) {
+    uploadPromises.push(
+      uploadToCloudinary(panCardBackFile[0], 'rush-basket/documents/pan').then(
+        (result) => ({ field: 'panCardBack', result })
+      )
+    );
+  }
+
+  const aadharCardFrontFile = files.aadharCardFront || files['aadharCardFront '] || files[' aadharCardFront'];
+  if (aadharCardFrontFile && aadharCardFrontFile[0]) {
+    uploadPromises.push(
+      uploadToCloudinary(aadharCardFrontFile[0], 'rush-basket/documents/aadhar').then(
+        (result) => ({ field: 'aadharCardFront', result })
+      )
+    );
+  }
+
+  const aadharCardBackFile = files.aadharCardBack || files['aadharCardBack '] || files[' aadharCardBack'];
+  if (aadharCardBackFile && aadharCardBackFile[0]) {
+    uploadPromises.push(
+      uploadToCloudinary(aadharCardBackFile[0], 'rush-basket/documents/aadhar').then(
+        (result) => ({ field: 'aadharCardBack', result })
+      )
+    );
+  }
+
+  const drivingLicenseFile = files.drivingLicense || files['drivingLicense '] || files[' drivingLicense'];
+  if (drivingLicenseFile && drivingLicenseFile[0]) {
+    uploadPromises.push(
+      uploadToCloudinary(drivingLicenseFile[0], 'rush-basket/documents/driving-license').then(
+        (result) => ({ field: 'drivingLicense', result })
+      )
+    );
+  }
+
+  const cancelChequeFile = files.cancelCheque || files['cancelCheque '] || files[' cancelCheque'];
+  if (cancelChequeFile && cancelChequeFile[0]) {
+    uploadPromises.push(
+      uploadToCloudinary(cancelChequeFile[0], 'rush-basket/documents/bank').then(
+        (result) => ({ field: 'cancelCheque', result })
+      )
+    );
+  }
+
+  const profileImageFile = files.profileImage || files['profileImage '] || files[' profileImage'];
+  if (profileImageFile && profileImageFile[0]) {
+    uploadPromises.push(
+      uploadToCloudinary(profileImageFile[0], 'rush-basket/vendor-profiles').then(
+        (result) => ({ field: 'profileImage', result })
+      )
+    );
+  }
+
+  const uploadResults = await Promise.all(uploadPromises);
+  const uploadedFiles = {};
+  uploadResults.forEach(({ field, result }) => {
+    if (field === 'storeImage') {
+      if (!uploadedFiles.storeImage) {
+        uploadedFiles.storeImage = [];
+      }
+      uploadedFiles.storeImage.push(result);
+    } else {
+      uploadedFiles[field] = result;
+    }
+  });
+
+  return uploadedFiles;
+};
+
+const updateVendorPermissions = (vendor, permissions) => {
+  if (!permissions) return;
+
+  try {
+    const permissionsObj = typeof permissions === 'string' ? JSON.parse(permissions) : permissions;
+    if (permissionsObj.canManageProducts !== undefined) {
+      vendor.permissions.canManageProducts = permissionsObj.canManageProducts;
+    }
+    if (permissionsObj.canManageOrders !== undefined) {
+      vendor.permissions.canManageOrders = permissionsObj.canManageOrders;
+    }
+    if (permissionsObj.canManageInventory !== undefined) {
+      vendor.permissions.canManageInventory = permissionsObj.canManageInventory;
+    }
+    if (permissionsObj.canViewAnalytics !== undefined) {
+      vendor.permissions.canViewAnalytics = permissionsObj.canViewAnalytics;
+    }
+    if (permissionsObj.canManageDiscounts !== undefined) {
+      vendor.permissions.canManageDiscounts = permissionsObj.canManageDiscounts;
+    }
+    if (permissionsObj.canManagePromotions !== undefined) {
+      vendor.permissions.canManagePromotions = permissionsObj.canManagePromotions;
+    }
+    if (permissionsObj.canExportData !== undefined) {
+      vendor.permissions.canExportData = permissionsObj.canExportData;
+    }
+    if (permissionsObj.canManageReviews !== undefined) {
+      vendor.permissions.canManageReviews = permissionsObj.canManageReviews;
+    }
+  } catch (parseError) {
+    logger.error('Error parsing permissions:', parseError);
+    throw new Error('Invalid permissions format');
+  }
+};
+
+const createVendorData = async (vendor, data, files, adminId) => {
+  const {
+    vendorName,
+    altContactNumber,
+    email,
+    gender,
+    dateOfBirth,
+    storeName,
+    storeAddressLine1,
+    storeAddressLine2,
+    pinCode,
+    latitude,
+    longitude,
+    city,
+    state,
+    ifsc,
+    accountNumber,
+    bankName,
+    bank_name,
+    permissions,
+    serviceRadius,
+    handlingChargePercentage,
+  } = data;
+
+  const finalBankName = (bankName || bank_name || '').trim();
+
+  if (!finalBankName) {
+    throw new Error('Bank name is required');
+  }
+
+  // Validate PIN code with Post Office API, with fallback to manual city/state
+  let cityValue = city;
+  let stateValue = state;
+  
+  const postOfficeData = await getPostOfficeDetails(pinCode);
+  if (postOfficeData.success) {
+    // Use API data if available
+    cityValue = postOfficeData.city;
+    stateValue = postOfficeData.state;
+    logger.info(`Successfully validated PIN code ${pinCode} via API: ${cityValue}, ${stateValue}`);
+  } else {
+    // API failed - check if manual city/state provided as fallback
+    const errorMsg = typeof postOfficeData.error === 'string' 
+      ? postOfficeData.error 
+      : JSON.stringify(postOfficeData.error);
+    
+    if (city && state) {
+      cityValue = city.trim();
+      stateValue = state.trim();
+      logger.warn(`Post Office API failed for PIN ${pinCode}, using manual city/state: ${cityValue}, ${stateValue}`);
+      logger.warn(`API Error: ${errorMsg}`);
+    } else {
+      // No fallback available - throw error with helpful message
+      logger.error(`PIN code validation failed for PIN ${pinCode}. Error: ${errorMsg}`);
+      
+      // Provide a clear, user-friendly error message
+      const userFriendlyError = errorMsg.includes('Network error') || errorMsg.includes('ECONNRESET') || errorMsg.includes('timeout')
+        ? `Post Office API is currently unavailable. Please provide 'city' and 'state' fields in your request as a fallback. (PIN: ${pinCode})`
+        : `Invalid PIN code: ${pinCode}. ${errorMsg}. Alternatively, provide 'city' and 'state' fields manually.`;
+      
+      throw new Error(userFriendlyError);
+    }
+  }
+
+  // Generate storeId first and ensure it's unique
+  let storeId;
+  try {
+    storeId = await Vendor.generateStoreId();
+    if (!storeId) {
+      throw new Error('Failed to generate store ID');
+    }
+  } catch (error) {
+    logger.error('StoreId generation error:', error);
+    throw new Error('Failed to generate unique store ID. Please try again.');
+  }
+
+  // Set storeId immediately to prevent null storeId issues
+  vendor.storeId = storeId;
+
+  const uploadedFiles = await uploadVendorFiles(files);
+
+  vendor.vendorName = vendorName;
+  vendor.altContactNumber = altContactNumber;
+  vendor.email = email;
+  vendor.gender = gender;
+  vendor.dateOfBirth = dateOfBirth;
+  
+  // Auto-calculate age from date of birth
+  if (dateOfBirth) {
+    const birthDate = new Date(dateOfBirth);
+    const today = new Date();
+    let age = today.getFullYear() - birthDate.getFullYear();
+    const monthDiff = today.getMonth() - birthDate.getMonth();
+    if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
+      age--;
+    }
+    vendor.age = age;
+  }
+  vendor.storeName = storeName;
+  vendor.storeAddress = {
+    line1: storeAddressLine1,
+    line2: storeAddressLine2,
+    pinCode: pinCode,
+    city: cityValue,
+    state: stateValue,
+    latitude: latitude ? parseFloat(latitude) : undefined,
+    longitude: longitude ? parseFloat(longitude) : undefined,
+  };
+
+  vendor.bankDetails = {
+    ifsc: ifsc.toUpperCase(),
+    accountNumber: accountNumber,
+    bankName: finalBankName,
+  };
+  vendor.createdBy = adminId;
+  vendor.serviceRadius = serviceRadius ? parseFloat(serviceRadius) : 5; // Default service radius of 5 km
+  vendor.handlingChargePercentage = handlingChargePercentage !== undefined ? parseFloat(handlingChargePercentage) : 0; // Default handling charge percentage 0
+
+  updateVendorPermissions(vendor, permissions);
+
+  if (uploadedFiles.storeImage) {
+    vendor.storeImage = uploadedFiles.storeImage;
+  }
+
+  if (uploadedFiles.panCardFront) {
+    vendor.documents = vendor.documents || {};
+    vendor.documents.panCardFront = uploadedFiles.panCardFront;
+  }
+
+  if (uploadedFiles.panCardBack) {
+    vendor.documents = vendor.documents || {};
+    vendor.documents.panCardBack = uploadedFiles.panCardBack;
+  }
+
+  if (uploadedFiles.aadharCardFront) {
+    vendor.documents = vendor.documents || {};
+    vendor.documents.aadharCardFront = uploadedFiles.aadharCardFront;
+  }
+
+  if (uploadedFiles.aadharCardBack) {
+    vendor.documents = vendor.documents || {};
+    vendor.documents.aadharCardBack = uploadedFiles.aadharCardBack;
+  }
+
+  if (uploadedFiles.drivingLicense) {
+    vendor.documents = vendor.documents || {};
+    vendor.documents.drivingLicense = uploadedFiles.drivingLicense;
+  }
+
+  if (uploadedFiles.cancelCheque) {
+    vendor.bankDetails.cancelCheque = uploadedFiles.cancelCheque;
+  }
+
+  if (uploadedFiles.profileImage) {
+    vendor.profileImage = uploadedFiles.profileImage;
+  }
+
+  return vendor;
+};
+
+const updateVendorData = async (vendor, data, files) => {
+  const {
+    vendorName,
+    altContactNumber,
+    email,
+    gender,
+    dateOfBirth,
+    storeName,
+    storeAddressLine1,
+    storeAddressLine2,
+    pinCode,
+    latitude,
+    longitude,
+    city,
+    state,
+    ifsc,
+    accountNumber,
+    bankName,
+    bank_name,
+    permissions,
+    handlingChargePercentage,
+    serviceRadius,
+    fssaiNumber,
+    deliveryChargePerKm,
+  } = data;
+
+  if (vendorName !== undefined) {
+    vendor.vendorName = vendorName;
+  }
+  if (altContactNumber !== undefined) {
+    vendor.altContactNumber = altContactNumber;
+  }
+  if (email !== undefined) {
+    vendor.email = email;
+  }
+  if (gender !== undefined) {
+    vendor.gender = gender;
+  }
+  if (dateOfBirth !== undefined) {
+    vendor.dateOfBirth = dateOfBirth;
+  }
+  if (storeName !== undefined) {
+    vendor.storeName = storeName;
+  }
+
+  if (pinCode !== undefined) {
+    // Validate PIN code with Post Office API, with fallback to manual city/state
+    let cityValue = city;
+    let stateValue = state;
+    
+    const postOfficeData = await getPostOfficeDetails(pinCode);
+    if (postOfficeData.success) {
+      // Use API data if available
+      cityValue = postOfficeData.city;
+      stateValue = postOfficeData.state;
+      logger.info(`Successfully validated PIN code ${pinCode} via API: ${cityValue}, ${stateValue}`);
+    } else {
+      // API failed - check if manual city/state provided as fallback
+      const errorMsg = typeof postOfficeData.error === 'string' 
+        ? postOfficeData.error 
+        : JSON.stringify(postOfficeData.error);
+      
+      if (city && state) {
+        cityValue = city.trim();
+        stateValue = state.trim();
+        logger.warn(`Post Office API failed for PIN ${pinCode}, using manual city/state: ${cityValue}, ${stateValue}`);
+        logger.warn(`API Error: ${errorMsg}`);
+      } else if (vendor.storeAddress && vendor.storeAddress.city && vendor.storeAddress.state) {
+        // Keep existing city/state if API fails and no new values provided
+        cityValue = vendor.storeAddress.city;
+        stateValue = vendor.storeAddress.state;
+        logger.warn(`Post Office API failed for PIN ${pinCode}, keeping existing city/state: ${cityValue}, ${stateValue}`);
+        logger.warn(`API Error: ${errorMsg}`);
+      } else {
+        // No fallback available - throw error with helpful message
+        logger.error(`PIN code validation failed for PIN ${pinCode}. Error: ${errorMsg}`);
+        
+        // Provide a clear, user-friendly error message
+        const userFriendlyError = errorMsg.includes('Network error') || errorMsg.includes('ECONNRESET') || errorMsg.includes('timeout')
+          ? `Post Office API is currently unavailable. Please provide 'city' and 'state' fields in your request as a fallback. (PIN: ${pinCode})`
+          : `Invalid PIN code: ${pinCode}. ${errorMsg}. Alternatively, provide 'city' and 'state' fields manually.`;
+        
+        throw new Error(userFriendlyError);
+      }
+    }
+
+    vendor.storeAddress = vendor.storeAddress || {};
+    vendor.storeAddress.pinCode = pinCode;
+    vendor.storeAddress.city = cityValue;
+    vendor.storeAddress.state = stateValue;
+  }
+
+  if (storeAddressLine1 !== undefined) {
+    vendor.storeAddress = vendor.storeAddress || {};
+    vendor.storeAddress.line1 = storeAddressLine1;
+  }
+  if (storeAddressLine2 !== undefined) {
+    vendor.storeAddress = vendor.storeAddress || {};
+    vendor.storeAddress.line2 = storeAddressLine2;
+  }
+  if (latitude !== undefined) {
+    vendor.storeAddress = vendor.storeAddress || {};
+    vendor.storeAddress.latitude = latitude ? parseFloat(latitude) : undefined;
+  }
+  if (longitude !== undefined) {
+    vendor.storeAddress = vendor.storeAddress || {};
+    vendor.storeAddress.longitude = longitude ? parseFloat(longitude) : undefined;
+  }
+
+  if (ifsc !== undefined || accountNumber !== undefined || bankName !== undefined || bank_name !== undefined) {
+    vendor.bankDetails = vendor.bankDetails || {};
+    if (ifsc !== undefined) {
+      vendor.bankDetails.ifsc = ifsc.toUpperCase();
+    }
+    if (accountNumber !== undefined) {
+      vendor.bankDetails.accountNumber = accountNumber;
+    }
+    if (bankName !== undefined || bank_name !== undefined) {
+      const finalBankName = (bankName || bank_name || '').trim();
+      if (finalBankName) {
+        vendor.bankDetails.bankName = finalBankName;
+      }
+    }
+  }
+
+  if (permissions !== undefined) {
+    updateVendorPermissions(vendor, permissions);
+  }
+
+  if (serviceRadius !== undefined) {
+    vendor.serviceRadius = parseFloat(serviceRadius);
+  }
+
+  if (handlingChargePercentage !== undefined) {
+    vendor.handlingChargePercentage = parseFloat(handlingChargePercentage);
+  }
+
+  if (fssaiNumber !== undefined) {
+    vendor.fssaiNumber = fssaiNumber.trim();
+  }
+
+  if (deliveryChargePerKm !== undefined) {
+    vendor.deliveryChargePerKm = parseFloat(deliveryChargePerKm);
+  }
+
+  if (files) {
+    const uploadedFiles = await uploadVendorFiles(files);
+
+    if (uploadedFiles.storeImage && uploadedFiles.storeImage.length > 0) {
+      if (vendor.storeImage && vendor.storeImage.length > 0) {
+        vendor.storeImage = [...vendor.storeImage, ...uploadedFiles.storeImage];
+      } else {
+        vendor.storeImage = uploadedFiles.storeImage;
+      }
+    }
+
+    if (uploadedFiles.cancelCheque) {
+      vendor.bankDetails = vendor.bankDetails || {};
+      vendor.bankDetails.cancelCheque = uploadedFiles.cancelCheque;
+    }
+
+    if (uploadedFiles.profileImage) {
+      // Delete old profile image if exists
+      if (vendor.profileImage && vendor.profileImage.publicId) {
+        const { deleteFromCloudinary } = require('../utils/cloudinary');
+        try {
+          await deleteFromCloudinary(vendor.profileImage.publicId);
+        } catch (deleteError) {
+          logger.error('Error deleting old vendor profile image:', deleteError);
+          // Continue even if deletion fails
+        }
+      }
+      vendor.profileImage = uploadedFiles.profileImage;
+    }
+  }
+
+  return vendor;
+};
+
+module.exports = {
+  uploadVendorFiles,
+  updateVendorPermissions,
+  createVendorData,
+  updateVendorData,
+};
+

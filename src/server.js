@@ -1,0 +1,436 @@
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const compression = require('compression');
+const { initializeQueues } = require('./utils/queue');
+const { disableExpiredOffers, processDailyOffers } = require('./utils/offerExpiryService');
+const logger = require('./utils/logger');
+
+// Workers are initialized after queues are set up in the mongoose connection block
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const http = require('http');
+let server = null;
+
+const cookieParser = require('cookie-parser');
+
+app.use(compression());
+
+// Middleware to capture raw body for incorrect content-type handling
+// This must run BEFORE express.json() to intercept requests with wrong content-type
+app.use((req, res, next) => {
+  if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+    const contentType = req.headers['content-type'] || '';
+    // If content-type is wrong but should be JSON, capture and parse raw body
+    if (contentType.includes('javascript') || (contentType.includes('text') && !contentType.includes('json'))) {
+      let data = '';
+      req.on('data', chunk => {
+        data += chunk.toString();
+      });
+      req.on('end', () => {
+        try {
+          req.rawBody = data;
+          if (data.trim()) {
+            req.body = JSON.parse(data);
+          } else {
+            req.body = {};
+          }
+        } catch (e) {
+          req.rawBody = data;
+          req.body = {};
+
+          // Check for common JSON errors and provide helpful messages
+          let errorMessage = 'Invalid JSON format in request body';
+          let hint = '';
+
+          if (e.message.includes('trailing comma') || e.message.includes('Expected double-quoted property name')) {
+            errorMessage = 'JSON syntax error: Trailing comma detected';
+            hint = 'Remove trailing commas from your JSON. Example: {"quantity": 5} not {"quantity": 5,}';
+          } else if (e.message.includes('Unexpected token')) {
+            errorMessage = 'JSON syntax error: Unexpected token';
+            hint = 'Check for missing quotes, brackets, or invalid characters';
+          } else if (e.message.includes('Unexpected end')) {
+            errorMessage = 'JSON syntax error: Incomplete JSON';
+            hint = 'Ensure all brackets and braces are properly closed';
+          }
+
+          // Return error response immediately for better UX
+          return res.status(400).json({
+            success: false,
+            error: errorMessage,
+            message: e.message,
+            hint: hint || 'Please ensure: 1) All property names use double quotes, 2) No trailing commas, 3) Valid JSON syntax',
+            position: e.message.match(/position (\d+)/)?.[1]
+          });
+        }
+        next();
+      });
+      return;
+    }
+  }
+  next();
+});
+
+// JSON parser with better error handling
+app.use(express.json({
+  limit: '10mb',
+  strict: true,
+  verify: (req, res, buf, encoding) => {
+    try {
+      JSON.parse(buf.toString());
+    } catch (e) {
+    }
+  }
+}));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(cookieParser());
+
+const cors = require('cors');
+const superadminRoutes = require('./routes/superadmin');
+const adminRoutes = require('./routes/admin');
+const authRoutes = require('./routes/auth');
+const vendorRoutes = require('./routes/vendor');
+const userRoutes = require('./routes/user');
+const riderRoutes = require('./routes/rider');
+const categoryRoutes = require('./routes/category');
+const subCategoryRoutes = require('./routes/subCategory');
+const productRoutes = require('./routes/product');
+const couponRoutes = require('./routes/coupon');
+const checkoutRoutes = require('./routes/checkout');
+const wishlistRoutes = require('./routes/wishlist');
+const queueRoutes = require('./routes/queue');
+const riderJobPostRoutes = require('./routes/riderJobPost');
+const riderJobApplicationRoutes = require('./routes/riderJobApplication');
+const bannerRoutes = require('./routes/banner');
+const analyticsRoutes = require('./routes/analytics');
+const suggestionRoutes = require('./routes/suggestion');
+const ticketRoutes = require('./routes/ticket');
+const invoiceRoutes = require('./routes/invoice');
+const paymentGatewayRoutes = require('./routes/paymentGateway');
+const paymentRoutes = require('./routes/payment');
+const paymentRequestRoutes = require('./routes/paymentRequest');
+const walletRoutes = require('./routes/wallet');
+const cashbackRoutes = require('./routes/cashback');
+const userNotificationRoutes = require('./routes/userNotification');
+const dailyOrderRoutes = require('./routes/dailyOrder');
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    const allowedOrigins = [
+      'http://localhost:3000',
+      'http://localhost:5173',
+      'http://localhost:5174',
+      'http://localhost:3001',
+      'http://127.0.0.1:3000',
+      'http://127.0.0.1:5173',
+      'http://127.0.0.1:5174',
+      'http://46.202.164.93',
+      'https://grocery.rushbaskets.com',
+      'https://grocery.rushbaskets.com/',
+      'https://admin.rushbaskets.com',
+      'https://admin.rushbaskets.com/',
+      'https://api.rushbaskets.com',
+      'https://api.rushbaskets.com/',
+      process.env.CORS_ORIGIN,
+    ].filter(Boolean);
+
+    // Normalize origin (remove trailing slash for comparison)
+    const normalizedOrigin = origin ? origin.replace(/\/$/, '') : null;
+    const normalizedAllowedOrigins = allowedOrigins.map(o => o.replace(/\/$/, ''));
+
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) {
+      return callback(null, true);
+    }
+
+    // Check if origin matches any allowed origin
+    if (normalizedAllowedOrigins.includes(normalizedOrigin)) {
+      callback(null, true);
+    } else {
+      // Log for debugging
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true, // IMPORTANT: Cookies allow karne ke liye
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH', 'HEAD'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-Requested-With',
+    'Accept',
+    'Origin',
+    'Access-Control-Request-Method',
+    'Access-Control-Request-Headers',
+    'X-CSRF-Token'
+  ],
+  exposedHeaders: ['Set-Cookie', 'Authorization'],
+  optionsSuccessStatus: 200,
+  preflightContinue: false,
+};
+
+app.use(cors(corsOptions));
+
+app.use((req, res, next) => {
+  const originalJson = res.json;
+  res.json = function (data) {
+    return originalJson.call(this, data);
+  };
+  next();
+});
+
+// Error handler for JSON parsing errors (must be before routes)
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    return res.status(400).json({
+      success: false,
+      error: 'Invalid JSON format in request body',
+      message: err.message,
+      hint: 'Please ensure: 1) All property names use double quotes, 2) No trailing commas, 3) Valid JSON syntax'
+    });
+  }
+  next(err);
+});
+
+app.use('/api/auth', authRoutes);
+app.use('/api/superadmin', superadminRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/vendor', vendorRoutes);
+app.use('/api/user', userRoutes);
+app.use('/api/rider', riderRoutes);
+app.use('/api/category', categoryRoutes);
+app.use('/api/subcategory', subCategoryRoutes);
+app.use('/api/product', productRoutes);
+app.use('/api/products', productRoutes);
+app.use('/api/coupon', couponRoutes);
+app.use('/api/checkout', checkoutRoutes);
+app.use('/api/wishlist', wishlistRoutes);
+app.use('/api/queue', queueRoutes);
+app.use('/api/rider-job-post', riderJobPostRoutes);
+app.use('/api/rider-job-application', riderJobApplicationRoutes);
+app.use('/api/banner', bannerRoutes);
+app.use('/api/analytics', analyticsRoutes);
+app.use('/api/suggestion', suggestionRoutes);
+app.use('/api/invoice', invoiceRoutes);
+app.use('/api/ticket', ticketRoutes);
+app.use('/api/payment-gateway', paymentGatewayRoutes);
+app.use('/api/payment', paymentRoutes);
+app.use('/api/payment-request', paymentRequestRoutes);
+app.use('/api/wallet', walletRoutes);
+app.use('/api/cashback', cashbackRoutes);
+app.use('/api/notifications', userNotificationRoutes);
+app.use('/api/daily-order', dailyOrderRoutes);
+
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+mongoose.connect(process.env.MONGODB_URI || process.env.MONGO_URI || 'mongodb://localhost:27017/rushbasket')
+  .then(async () => {
+    // Fix index issues - drop problematic unique indexes if they exist
+    try {
+      const db = mongoose.connection.db;
+      const usersCollection = db.collection('users');
+
+      // Get all indexes
+      const indexes = await usersCollection.indexes();
+
+      // Drop email_1 index if it exists and is unique
+      const emailIndex = indexes.find(idx => idx.name === 'email_1');
+      if (emailIndex && emailIndex.unique) {
+        try {
+          await usersCollection.dropIndex('email_1');
+        } catch (dropError) {
+        }
+      }
+
+      // Drop phone_1 index if it exists and is unique
+      const phoneIndex = indexes.find(idx => idx.name === 'phone_1');
+      if (phoneIndex && phoneIndex.unique) {
+        try {
+          await usersCollection.dropIndex('phone_1');
+        } catch (dropError) {
+        }
+      }
+    } catch (indexError) {
+    }
+
+    initializeQueues();
+
+    // Initialize Workers
+    try {
+      const { initializeEmailWorker } = require('./workers/emailWorker');
+      const { initializeSMSWorker } = require('./workers/smsWorker');
+      const { initializeNotificationWorker } = require('./workers/notificationWorker');
+      const { initializeImageProcessingWorker } = require('./workers/imageProcessingWorker');
+
+      initializeEmailWorker();
+      initializeSMSWorker();
+      initializeNotificationWorker();
+      initializeImageProcessingWorker();
+    } catch (workerError) {
+      logger.error('Error initializing workers:', workerError);
+    }
+
+    // Create HTTP server
+    server = http.createServer(app);
+
+    // Initialize Socket.io (optional - will gracefully handle if not installed)
+    try {
+      const { initializeSocket } = require('./utils/socket');
+      const socketResult = initializeSocket(server);
+    } catch (socketError) {
+    }
+
+    server.listen(PORT, () => {
+      // Run on startup
+      disableExpiredOffers().then(result => {
+      });
+
+      // Schedule daily offer processing to run daily at 5 AM IST
+      const scheduleDailyOfferCheck = () => {
+        const now = new Date();
+        const tomorrow = new Date(now);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        tomorrow.setHours(5, 0, 0, 0); // Set to 5 AM tomorrow
+
+        // If it's already past 5 AM today, schedule for tomorrow
+        const today5AM = new Date(now);
+        today5AM.setHours(5, 0, 0, 0);
+
+        const nextRun = now < today5AM ? today5AM : tomorrow;
+        const msUntilNextRun = nextRun.getTime() - now.getTime();
+
+        setTimeout(() => {
+          // Process daily offers (disable expired and enable new ones)
+          processDailyOffers().then(result => {
+            if (result.success) {
+            }
+          }).catch(error => {
+          });
+
+          // Also run general expired offers check
+          disableExpiredOffers().then(result => {
+          }).catch(error => {
+          });
+
+          // Schedule next day
+          scheduleDailyOfferCheck();
+        }, msUntilNextRun);
+      };
+
+      // Start scheduling
+      scheduleDailyOfferCheck();
+
+      // Schedule subscription commission processing to run daily at 6 AM IST
+      const { processSubscriptionCommissions } = require('./workers/subscriptionCommissionWorker');
+
+      const scheduleSubscriptionCommissionCheck = () => {
+        const now = new Date();
+        const tomorrow = new Date(now);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        tomorrow.setHours(6, 0, 0, 0); // Set to 6 AM tomorrow
+
+        // If it's already past 6 AM today, schedule for tomorrow
+        const today6AM = new Date(now);
+        today6AM.setHours(6, 0, 0, 0);
+
+        const nextRun = now < today6AM ? today6AM : tomorrow;
+        const msUntilNextRun = nextRun.getTime() - now.getTime();
+
+        setTimeout(() => {
+          // Process subscription commissions
+          processSubscriptionCommissions().then(result => {
+            if (result.success) {
+              logger.info(`Subscription commission processing completed: ${result.processed} processed, ${result.failed} failed`);
+            }
+          }).catch(error => {
+            logger.error('Error in subscription commission processing:', error);
+          });
+
+          // Schedule next day
+          scheduleSubscriptionCommissionCheck();
+        }, msUntilNextRun);
+      };
+
+      // Start scheduling subscription commission check
+      scheduleSubscriptionCommissionCheck();
+
+      // Schedule daily offer notifications to run every 30 minutes
+      const { sendDailyOfferNotificationsToUsers } = require('./services/dailyOfferNotificationService');
+
+      const scheduleDailyOfferNotifications = () => {
+        const INTERVAL_MS = 30 * 60 * 1000; // 30 minutes in milliseconds
+
+        // Function to run the notification job
+        const runNotificationJob = () => {
+          sendDailyOfferNotificationsToUsers()
+            .then(result => {
+              if (result.success) {
+                logger.info(
+                  `Daily offer notifications completed: ${result.sent} sent, ${result.processed} processed, ${result.skipped} skipped, ${result.errors} errors`
+                );
+              } else {
+                logger.error(`Daily offer notifications failed: ${result.error}`);
+              }
+            })
+            .catch(error => {
+              logger.error('Error in daily offer notification process:', error);
+            });
+        };
+
+        // Calculate next run time (next 30-minute interval: :00 or :30)
+        const now = new Date();
+        const minutes = now.getMinutes();
+        const nextRun = new Date(now);
+
+        if (minutes < 30) {
+          // Next run at :30 of current hour
+          nextRun.setMinutes(30, 0, 0);
+        } else {
+          // Next run at :00 of next hour
+          nextRun.setHours(nextRun.getHours() + 1);
+          nextRun.setMinutes(0, 0, 0);
+        }
+
+        const msUntilNextRun = nextRun.getTime() - now.getTime();
+
+        logger.info(`Daily offer notifications scheduled to run at ${nextRun.toISOString()} (in ${Math.round(msUntilNextRun / 1000 / 60)} minutes)`);
+
+        // Schedule first run
+        setTimeout(() => {
+          // Run immediately
+          runNotificationJob();
+
+          // Then run every 30 minutes
+          const intervalId = setInterval(runNotificationJob, INTERVAL_MS);
+
+          // Store interval ID for potential cleanup
+          if (global.dailyOfferNotificationInterval) {
+            clearInterval(global.dailyOfferNotificationInterval);
+          }
+          global.dailyOfferNotificationInterval = intervalId;
+
+          logger.info('Daily offer notification interval started (every 30 minutes)');
+        }, msUntilNextRun);
+      };
+
+      // Start scheduling daily offer notifications
+      scheduleDailyOfferNotifications();
+    });
+  })
+  .catch((error) => {
+    process.exit(1);
+  });
+
+process.on('unhandledRejection', (err) => {
+  process.exit(1);
+});
+
+process.on('uncaughtException', (err) => {
+  process.exit(1);
+});
+
+// Export app for backward compatibility
+module.exports = app;
+

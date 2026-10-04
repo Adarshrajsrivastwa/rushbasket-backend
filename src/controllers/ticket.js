@@ -1,0 +1,1584 @@
+const Ticket = require('../models/Ticket');
+const Notification = require('../models/Notification');
+const { validationResult } = require('express-validator');
+const { executeQuery } = require('../utils/queryManager');
+const User = require('../models/User');
+const Vendor = require('../models/Vendor');
+const Rider = require('../models/Rider');
+const Admin = require('../models/Admin');
+const logger = require('../utils/logger');
+
+// Helper function to populate messages with sender info
+const populateMessages = async (messages) => {
+  if (!messages || messages.length === 0) return;
+
+  // Collect all sender IDs by type
+  const senderIds = {
+    users: [],
+    vendors: [],
+    riders: [],
+    admins: []
+  };
+
+  messages.forEach(msg => {
+    if (msg.sender && msg.senderModel) {
+      const senderId = msg.sender.toString ? msg.sender.toString() : msg.sender;
+      if (msg.senderModel === 'User') {
+        senderIds.users.push(senderId);
+      } else if (msg.senderModel === 'Vendor') {
+        senderIds.vendors.push(senderId);
+      } else if (msg.senderModel === 'Rider') {
+        senderIds.riders.push(senderId);
+      } else if (msg.senderModel === 'Admin') {
+        senderIds.admins.push(senderId);
+      }
+    }
+  });
+
+  // Fetch all senders in parallel
+  const [users, vendors, riders, admins] = await Promise.all([
+    senderIds.users.length > 0 ? User.find({ _id: { $in: senderIds.users } }).select('userName contactNumber email').lean() : [],
+    senderIds.vendors.length > 0 ? Vendor.find({ _id: { $in: senderIds.vendors } }).select('vendorName storeName contactNumber email').lean() : [],
+    senderIds.riders.length > 0 ? Rider.find({ _id: { $in: senderIds.riders } }).select('fullName mobileNumber email').lean() : [],
+    senderIds.admins.length > 0 ? Admin.find({ _id: { $in: senderIds.admins } }).select('name email').lean() : []
+  ]);
+
+  // Create maps for quick lookup
+  const userMap = new Map(users.map(u => [u._id.toString(), u]));
+  const vendorMap = new Map(vendors.map(v => [v._id.toString(), v]));
+  const riderMap = new Map(riders.map(r => [r._id.toString(), r]));
+  const adminMap = new Map(admins.map(a => [a._id.toString(), a]));
+
+  // Assign sender data to messages
+  messages.forEach(msg => {
+    if (msg.sender && msg.senderModel) {
+      const senderId = msg.sender.toString ? msg.sender.toString() : msg.sender;
+      if (msg.senderModel === 'User' && userMap.has(senderId)) {
+        msg.sender = userMap.get(senderId);
+      } else if (msg.senderModel === 'Vendor' && vendorMap.has(senderId)) {
+        msg.sender = vendorMap.get(senderId);
+      } else if (msg.senderModel === 'Rider' && riderMap.has(senderId)) {
+        msg.sender = riderMap.get(senderId);
+      } else if (msg.senderModel === 'Admin' && adminMap.has(senderId)) {
+        msg.sender = adminMap.get(senderId);
+      }
+    }
+  });
+};
+
+// Create a new ticket
+exports.createTicket = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    const { category, complaint, orderId } = req.body;
+    const userId = req.user._id;
+
+    // Generate unique ticket number
+    let ticketNumber;
+    try {
+      ticketNumber = await Ticket.generateTicketNumber();
+      if (!ticketNumber) {
+        throw new Error('Failed to generate ticket number');
+      }
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to generate ticket number. Please try again.',
+        message: error.message,
+      });
+    }
+
+    // Create ticket with creator info
+    const ticket = await Ticket.create({
+      ticketNumber,
+      user: userId,
+      createdBy: userId,
+      createdByModel: 'User',
+      category: category || 'general_queries',
+      complaint,
+      status: 'active',
+      orderId: orderId || null,
+      messages: [{
+        sender: userId,
+        senderModel: 'User',
+        message: complaint,
+        createdAt: new Date(),
+      }],
+    });
+
+    // Populate messages with sender info
+    await populateMessages(ticket.messages);
+
+    // Populate other fields
+    await ticket.populate('createdBy', 'userName contactNumber email');
+    await ticket.populate('orderId', 'orderNumber totalAmount status');
+
+    // Notify all active admins about new ticket
+    try {
+      logger.info(`Starting notification process for user ticket ${ticket.ticketNumber}`);
+      const { sendAdminPushNotification } = require('../utils/firebaseNotification');
+      
+      // Get all active admins with FCM token info
+      const activeAdmins = await Admin.find({ isActive: true }).select('_id name email fcmToken fcmTokens');
+      logger.info(`Found ${activeAdmins.length} active admin(s) to notify`);
+      
+      if (activeAdmins.length === 0) {
+        logger.warn('No active admins found. Skipping notification.');
+      } else {
+        // Check which admins have FCM tokens
+        const adminsWithTokens = activeAdmins.filter(admin => {
+          const hasToken = admin.fcmToken || (admin.fcmTokens && admin.fcmTokens.length > 0);
+          if (!hasToken) {
+            logger.warn(`Admin ${admin._id} (${admin.name || admin.email}) has no FCM tokens`);
+          }
+          return hasToken;
+        });
+        
+        logger.info(`${adminsWithTokens.length} out of ${activeAdmins.length} admin(s) have FCM tokens`);
+        
+        // Prepare notification data
+        const notificationData = {
+          type: 'ticket_created',
+          title: 'New Ticket Created',
+          message: `User has created a new ticket #${ticket.ticketNumber || ticket._id}. Category: ${ticket.category}`,
+          ticketId: ticket._id.toString(),
+          data: {
+            ticketId: ticket._id.toString(),
+            ticketNumber: ticket.ticketNumber || ticket._id.toString(),
+            category: ticket.category,
+            status: ticket.status,
+            createdBy: 'User',
+            userName: ticket.createdBy?.userName || 'User',
+            complaint: ticket.complaint.substring(0, 200) + (ticket.complaint.length > 200 ? '...' : ''),
+            orderId: ticket.orderId ? ticket.orderId.toString() : null,
+          },
+        };
+        
+        // Send push notification to each admin
+        let successCount = 0;
+        let failureCount = 0;
+        
+        for (const admin of activeAdmins) {
+          try {
+            logger.info(`Attempting to send notification to admin ${admin._id} (${admin.name || admin.email})`);
+            const pushResult = await sendAdminPushNotification(admin._id, notificationData);
+            if (pushResult && pushResult.success) {
+              successCount++;
+              logger.info(`✅ Push notification sent successfully to admin ${admin._id} for user ticket ${ticket.ticketNumber}. Success count: ${pushResult.successCount}, Failed: ${pushResult.failureCount}`);
+            } else {
+              failureCount++;
+              logger.warn(`❌ Failed to send push notification to admin ${admin._id}: ${pushResult?.error || 'Unknown error'}`);
+            }
+          } catch (adminNotifyError) {
+            failureCount++;
+            logger.error(`❌ Error sending push notification to admin ${admin._id}:`, adminNotifyError);
+          }
+        }
+        
+        logger.info(`📊 Notification summary for user ticket ${ticket.ticketNumber}: Total admins: ${activeAdmins.length}, Success: ${successCount}, Failed: ${failureCount}`);
+        
+        // Create Notification documents in database for all active admins
+        try {
+          logger.info(`Creating Notification documents for ${activeAdmins.length} active admin(s)`);
+          const notificationPromises = activeAdmins.map(admin => 
+            Notification.create({
+              recipient: admin._id,
+              recipientModel: 'Admin',
+              type: 'ticket_created',
+              title: 'New Ticket Created',
+              message: `User has created a new ticket #${ticket.ticketNumber || ticket._id}. Category: ${ticket.category}`,
+              data: {
+                ticketId: ticket._id.toString(),
+                ticketNumber: ticket.ticketNumber || ticket._id.toString(),
+                category: ticket.category,
+                status: ticket.status,
+                createdBy: 'User',
+                userName: ticket.createdBy?.userName || 'User',
+                complaint: ticket.complaint.substring(0, 200) + (ticket.complaint.length > 200 ? '...' : ''),
+                orderId: ticket.orderId ? ticket.orderId.toString() : null,
+              },
+              isRead: false,
+              isActive: true,
+            })
+          );
+          
+          const createdNotifications = await Promise.all(notificationPromises);
+          logger.info(`✅ Created ${createdNotifications.length} Notification documents for user ticket ${ticket.ticketNumber}`);
+        } catch (dbNotifyError) {
+          // Don't fail the request if notification creation fails
+          logger.error('❌ Error creating Notification documents for user ticket:', dbNotifyError);
+        }
+      }
+    } catch (notifyError) {
+      // Don't fail the request if notification fails
+      logger.error('❌ Error in notification process for user ticket creation:', notifyError);
+      logger.error('Notification error stack:', notifyError.stack);
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Ticket created successfully',
+      data: {
+        ticket,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to create ticket',
+      message: error.message,
+    });
+  }
+};
+
+// Get all tickets for the logged-in user
+exports.getTickets = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    const userId = req.user._id;
+    const { page = 1, limit = 10, status, category } = req.query;
+
+    // Build filters
+    const filters = { user: userId };
+    if (status) {
+      filters.status = status;
+    }
+    if (category) {
+      filters.category = category;
+    }
+
+    // Execute query with pagination
+    const result = await executeQuery(Ticket, {
+      filters,
+      sort: { createdAt: -1 },
+      pagination: { page: parseInt(page), limit: parseInt(limit) },
+      populate: [
+        { path: 'orderId', select: 'orderNumber totalAmount status' },
+        { path: 'createdBy', select: 'userName contactNumber email vendorName storeName' },
+      ],
+    });
+
+    // Manually populate messages with sender info for each ticket
+    if (result.data && result.data.length > 0) {
+      for (let ticket of result.data) {
+        if (ticket.messages && ticket.messages.length > 0) {
+          await populateMessages(ticket.messages);
+        }
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Tickets fetched successfully',
+      data: {
+        tickets: result.data,
+        pagination: result.pagination,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch tickets',
+      message: error.message,
+    });
+  }
+};
+
+// Get a single ticket by ID
+exports.getTicket = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    const { ticketId } = req.params;
+    const userId = req.user._id;
+
+    const ticket = await Ticket.findOne({
+      _id: ticketId,
+      user: userId,
+    })
+      .populate('orderId', 'orderNumber totalAmount status createdAt')
+      .populate('createdBy', 'userName contactNumber email vendorName storeName');
+
+    // Manually populate messages with sender info
+    if (ticket && ticket.messages && ticket.messages.length > 0) {
+      await populateMessages(ticket.messages);
+    }
+
+    if (!ticket) {
+      return res.status(404).json({
+        success: false,
+        error: 'Ticket not found',
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Ticket fetched successfully',
+      data: {
+        ticket,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch ticket',
+      message: error.message,
+    });
+  }
+};
+
+// Update ticket (for user - can update complaint, category, orderId)
+exports.updateTicket = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    const { ticketId } = req.params;
+    const { complaint, category, orderId } = req.body;
+    const userId = req.user._id;
+
+    const ticket = await Ticket.findOne({
+      _id: ticketId,
+      user: userId,
+    });
+
+    if (!ticket) {
+      return res.status(404).json({
+        success: false,
+        error: 'Ticket not found',
+      });
+    }
+
+    // Check if ticket can be updated (only active or pending tickets can be updated)
+    if (ticket.status === 'resolved' || ticket.status === 'closed') {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot update resolved or closed tickets',
+      });
+    }
+
+    // Update fields if provided
+    if (complaint !== undefined) {
+      ticket.complaint = complaint;
+    }
+    if (category !== undefined) {
+      ticket.category = category;
+    }
+    if (orderId !== undefined) {
+      ticket.orderId = orderId || null;
+    }
+
+    await ticket.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Ticket updated successfully',
+      data: {
+        ticket,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update ticket',
+      message: error.message,
+    });
+  }
+};
+
+// Add message to ticket (for user/vendor)
+exports.addTicketMessage = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    const { ticketId } = req.params;
+    const { message } = req.body;
+    const userId = req.user._id;
+
+    const ticket = await Ticket.findOne({
+      _id: ticketId,
+      user: userId,
+    });
+
+    if (!ticket) {
+      return res.status(404).json({
+        success: false,
+        error: 'Ticket not found',
+      });
+    }
+
+    // Check if ticket can receive messages (not closed)
+    if (ticket.status === 'closed') {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot add messages to closed tickets',
+      });
+    }
+
+    // Add message
+    ticket.messages.push({
+      sender: userId,
+      senderModel: 'User',
+      message,
+      createdAt: new Date(),
+    });
+
+    await ticket.save();
+
+    // Manually populate messages with sender info
+    const User = require('../models/User');
+    const Vendor = require('../models/Vendor');
+    const Admin = require('../models/Admin');
+
+    // Fetch all sender IDs first
+    const senderIds = {
+      users: [],
+      vendors: [],
+      admins: []
+    };
+
+    ticket.messages.forEach(msg => {
+      if (msg.senderModel === 'User' && msg.sender) {
+        senderIds.users.push(msg.sender);
+      } else if (msg.senderModel === 'Vendor' && msg.sender) {
+        senderIds.vendors.push(msg.sender);
+      } else if (msg.senderModel === 'Admin' && msg.sender) {
+        senderIds.admins.push(msg.sender);
+      }
+    });
+
+    // Fetch all senders in parallel
+    const [users, vendors, admins] = await Promise.all([
+      senderIds.users.length > 0 ? User.find({ _id: { $in: senderIds.users } }).select('userName contactNumber email').lean() : [],
+      senderIds.vendors.length > 0 ? Vendor.find({ _id: { $in: senderIds.vendors } }).select('vendorName storeName contactNumber email').lean() : [],
+      senderIds.admins.length > 0 ? Admin.find({ _id: { $in: senderIds.admins } }).select('name email').lean() : []
+    ]);
+
+    // Create maps for quick lookup
+    const userMap = new Map(users.map(u => [u._id.toString(), u]));
+    const vendorMap = new Map(vendors.map(v => [v._id.toString(), v]));
+    const adminMap = new Map(admins.map(a => [a._id.toString(), a]));
+
+    // Assign sender data to messages
+    ticket.messages.forEach(msg => {
+      const senderId = msg.sender?.toString();
+      if (msg.senderModel === 'User' && senderId && userMap.has(senderId)) {
+        msg.sender = userMap.get(senderId);
+      } else if (msg.senderModel === 'Vendor' && senderId && vendorMap.has(senderId)) {
+        msg.sender = vendorMap.get(senderId);
+      } else if (msg.senderModel === 'Admin' && senderId && adminMap.has(senderId)) {
+        msg.sender = adminMap.get(senderId);
+      }
+    });
+
+    // Also populate other fields
+    await ticket.populate('createdBy', 'userName contactNumber email vendorName storeName');
+    await ticket.populate('orderId', 'orderNumber totalAmount status');
+
+    res.status(200).json({
+      success: true,
+      message: 'Message added successfully',
+      data: {
+        ticket,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to add message',
+      message: error.message,
+    });
+  }
+};
+
+// Update ticket status (admin only)
+exports.updateTicketStatus = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    const { ticketId } = req.params;
+    const { status, adminResponse } = req.body;
+    const adminId = req.admin._id;
+
+    const ticket = await Ticket.findById(ticketId);
+
+    if (!ticket) {
+      return res.status(404).json({
+        success: false,
+        error: 'Ticket not found',
+      });
+    }
+
+    // Validate status
+    const validStatuses = ['active', 'pending', 'resolved', 'closed'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid status. Must be one of: ${validStatuses.join(', ')}`,
+      });
+    }
+
+    // Update status
+    const oldStatus = ticket.status;
+    ticket.status = status;
+    ticket.statusChangedBy = adminId;
+
+    // If resolving, set resolvedBy and resolvedAt
+    if (status === 'resolved') {
+      ticket.resolvedBy = adminId;
+      ticket.resolvedAt = new Date();
+      if (adminResponse) {
+        ticket.adminResponse = adminResponse;
+      }
+    }
+
+    await ticket.save();
+
+    // Populate messages with sender info
+    await populateMessages(ticket.messages);
+
+    // Also populate other fields
+    await ticket.populate('createdBy', 'userName contactNumber email vendorName storeName fullName mobileNumber');
+    await ticket.populate('user', 'userName contactNumber email');
+    await ticket.populate('vendor', 'vendorName storeName contactNumber email');
+    await ticket.populate('rider', 'fullName mobileNumber email');
+    await ticket.populate('orderId', 'orderNumber totalAmount status');
+
+    // Notify vendor if this is a vendor ticket
+    if (ticket.vendor && ticket.createdByModel === 'Vendor') {
+      try {
+        const { sendVendorPushNotification } = require('../utils/firebaseNotification');
+        const vendorId = ticket.vendor._id || ticket.vendor;
+        
+        const statusMessages = {
+          'active': 'Ticket is now active',
+          'pending': 'Ticket is pending review',
+          'resolved': 'Ticket has been resolved',
+          'closed': 'Ticket has been closed',
+        };
+
+        await sendVendorPushNotification(vendorId, {
+          type: 'ticket_status_updated',
+          title: 'Ticket Status Updated',
+          message: `Your ticket #${ticket.ticketNumber || ticket._id} status changed from ${oldStatus} to ${status}. ${statusMessages[status] || ''}`,
+          ticketId: ticket._id.toString(),
+          data: {
+            ticketId: ticket._id.toString(),
+            ticketNumber: ticket.ticketNumber || ticket._id.toString(),
+            status: status,
+            previousStatus: oldStatus,
+            adminResponse: ticket.adminResponse,
+            category: ticket.category,
+          },
+        });
+      } catch (notifyError) {
+        // Don't fail the request if push notification fails
+        logger.error('Error sending push notification to vendor for ticket status update:', notifyError);
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Ticket status updated successfully',
+      data: {
+        ticket,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update ticket status',
+      message: error.message,
+    });
+  }
+};
+
+// Add admin message to ticket
+exports.addAdminMessage = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    const { ticketId } = req.params;
+    const { message } = req.body;
+    const adminId = req.admin._id;
+
+    const ticket = await Ticket.findById(ticketId);
+
+    if (!ticket) {
+      return res.status(404).json({
+        success: false,
+        error: 'Ticket not found',
+      });
+    }
+
+    // Check if ticket can receive messages (not closed)
+    if (ticket.status === 'closed') {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot add messages to closed tickets',
+      });
+    }
+
+    // Add admin message
+    ticket.messages.push({
+      sender: adminId,
+      senderModel: 'Admin',
+      message,
+      createdAt: new Date(),
+    });
+
+    await ticket.save();
+
+    // Populate messages with sender info
+    await populateMessages(ticket.messages);
+
+    // Also populate other fields
+    await ticket.populate('createdBy', 'userName contactNumber email vendorName storeName fullName mobileNumber');
+    await ticket.populate('user', 'userName contactNumber email');
+    await ticket.populate('vendor', 'vendorName storeName contactNumber email');
+    await ticket.populate('rider', 'fullName mobileNumber email');
+    await ticket.populate('orderId', 'orderNumber totalAmount status');
+
+    // Notify vendor if this is a vendor ticket
+    if (ticket.vendor && ticket.createdByModel === 'Vendor') {
+      try {
+        const { sendVendorPushNotification } = require('../utils/firebaseNotification');
+        const vendorId = ticket.vendor._id || ticket.vendor;
+        
+        await sendVendorPushNotification(vendorId, {
+          type: 'ticket_message_received',
+          title: 'New Message on Your Ticket',
+          message: `Admin has replied to your ticket #${ticket.ticketNumber || ticket._id}. ${message.substring(0, 100)}${message.length > 100 ? '...' : ''}`,
+          ticketId: ticket._id.toString(),
+          data: {
+            ticketId: ticket._id.toString(),
+            ticketNumber: ticket.ticketNumber || ticket._id.toString(),
+            status: ticket.status,
+            message: message,
+            sender: 'Admin',
+            category: ticket.category,
+          },
+        });
+      } catch (notifyError) {
+        // Don't fail the request if push notification fails
+        logger.error('Error sending push notification to vendor for admin message:', notifyError);
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Message added successfully',
+      data: {
+        ticket,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to add message',
+      message: error.message,
+    });
+  }
+};
+
+// Get all tickets (admin only)
+exports.getAllTickets = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    const { page = 1, limit = 10, status, category, search, createdByModel } = req.query;
+
+    // Build filters - show tickets created by Users, Vendors, or Riders
+    const filters = {};
+    if (status) {
+      filters.status = status;
+    }
+    if (category) {
+      filters.category = category;
+    }
+    if (createdByModel) {
+      filters.createdByModel = createdByModel;
+    }
+    if (search) {
+      filters.$or = [
+        { ticketNumber: { $regex: search, $options: 'i' } },
+        { complaint: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    // Execute query with pagination
+    const result = await executeQuery(Ticket, {
+      filters,
+      sort: { createdAt: -1 },
+      pagination: { page: parseInt(page), limit: parseInt(limit) },
+      populate: [
+        { path: 'user', select: 'userName contactNumber email' },
+        { path: 'vendor', select: 'vendorName storeName contactNumber email' },
+        { path: 'rider', select: 'fullName mobileNumber email' },
+        { path: 'orderId', select: 'orderNumber totalAmount status' },
+        { path: 'createdBy', select: 'userName contactNumber email vendorName storeName fullName mobileNumber' },
+        { path: 'resolvedBy', select: 'name email' },
+        { path: 'statusChangedBy', select: 'name email' },
+      ],
+    });
+
+    // Populate messages with sender info for each ticket
+    if (result.data && result.data.length > 0) {
+      for (let ticket of result.data) {
+        if (ticket.messages && ticket.messages.length > 0) {
+          await populateMessages(ticket.messages);
+        }
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Tickets fetched successfully',
+      data: {
+        tickets: result.data,
+        pagination: result.pagination,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch tickets',
+      message: error.message,
+    });
+  }
+};
+
+// Get single ticket (admin only)
+exports.getAdminTicket = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    const { ticketId } = req.params;
+
+    const ticket = await Ticket.findById(ticketId)
+      .populate('user', 'userName contactNumber email')
+      .populate('vendor', 'vendorName storeName contactNumber email')
+      .populate('rider', 'fullName mobileNumber email')
+      .populate('orderId', 'orderNumber totalAmount status')
+      .populate('createdBy', 'userName contactNumber email vendorName storeName fullName mobileNumber')
+      .populate('resolvedBy', 'name email')
+      .populate('statusChangedBy', 'name email');
+
+    if (!ticket) {
+      return res.status(404).json({
+        success: false,
+        error: 'Ticket not found',
+      });
+    }
+
+    // Populate messages with sender info
+    if (ticket.messages && ticket.messages.length > 0) {
+      await populateMessages(ticket.messages);
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Ticket fetched successfully',
+      data: {
+        ticket,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch ticket',
+      message: error.message,
+    });
+  }
+};
+
+// ============ VENDOR TICKET FUNCTIONS ============
+
+// Create a new ticket (vendor)
+exports.createVendorTicket = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    const { category, complaint, orderId } = req.body;
+    const vendorId = req.vendor._id;
+
+    // Generate unique ticket number
+    let ticketNumber;
+    try {
+      ticketNumber = await Ticket.generateTicketNumber();
+      if (!ticketNumber) {
+        throw new Error('Failed to generate ticket number');
+      }
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to generate ticket number. Please try again.',
+        message: error.message,
+      });
+    }
+
+    // Create ticket with creator info
+    const ticket = await Ticket.create({
+      ticketNumber,
+      vendor: vendorId,
+      createdBy: vendorId,
+      createdByModel: 'Vendor',
+      category: category || 'general_queries',
+      complaint,
+      status: 'active',
+      orderId: orderId || null,
+      messages: [{
+        sender: vendorId,
+        senderModel: 'Vendor',
+        message: complaint,
+        createdAt: new Date(),
+      }],
+    });
+
+    // Populate messages with sender info
+    await populateMessages(ticket.messages);
+
+    // Populate other fields
+    await ticket.populate('createdBy', 'vendorName storeName contactNumber email');
+    await ticket.populate('vendor', 'vendorName storeName contactNumber email');
+    await ticket.populate('orderId', 'orderNumber totalAmount status');
+
+    // Notify all active admins about new vendor ticket
+    try {
+      logger.info(`Starting notification process for vendor ticket ${ticket.ticketNumber}`);
+      const { sendAdminPushNotification } = require('../utils/firebaseNotification');
+      
+      // Get all active admins with FCM token info
+      const activeAdmins = await Admin.find({ isActive: true }).select('_id name email fcmToken fcmTokens');
+      logger.info(`Found ${activeAdmins.length} active admin(s) to notify`);
+      
+      if (activeAdmins.length === 0) {
+        logger.warn('No active admins found. Skipping notification.');
+      } else {
+        // Check which admins have FCM tokens
+        const adminsWithTokens = activeAdmins.filter(admin => {
+          const hasToken = admin.fcmToken || (admin.fcmTokens && admin.fcmTokens.length > 0);
+          if (!hasToken) {
+            logger.warn(`Admin ${admin._id} (${admin.name || admin.email}) has no FCM tokens`);
+          }
+          return hasToken;
+        });
+        
+        logger.info(`${adminsWithTokens.length} out of ${activeAdmins.length} admin(s) have FCM tokens`);
+        
+        // Prepare notification data
+        const notificationData = {
+          type: 'ticket_created',
+          title: 'New Ticket Created',
+          message: `Vendor has created a new ticket #${ticket.ticketNumber || ticket._id}. Category: ${ticket.category}`,
+          ticketId: ticket._id.toString(),
+          data: {
+            ticketId: ticket._id.toString(),
+            ticketNumber: ticket.ticketNumber || ticket._id.toString(),
+            category: ticket.category,
+            status: ticket.status,
+            createdBy: 'Vendor',
+            vendorName: ticket.vendor?.vendorName || ticket.vendor?.storeName || 'Vendor',
+            complaint: ticket.complaint.substring(0, 200) + (ticket.complaint.length > 200 ? '...' : ''),
+            orderId: ticket.orderId ? ticket.orderId.toString() : null,
+          },
+        };
+        
+        // Send push notification to each admin
+        let successCount = 0;
+        let failureCount = 0;
+        
+        for (const admin of activeAdmins) {
+          try {
+            logger.info(`Attempting to send notification to admin ${admin._id} (${admin.name || admin.email})`);
+            const pushResult = await sendAdminPushNotification(admin._id, notificationData);
+            if (pushResult && pushResult.success) {
+              successCount++;
+              logger.info(`✅ Push notification sent successfully to admin ${admin._id} for vendor ticket ${ticket.ticketNumber}. Success count: ${pushResult.successCount}, Failed: ${pushResult.failureCount}`);
+            } else {
+              failureCount++;
+              logger.warn(`❌ Failed to send push notification to admin ${admin._id}: ${pushResult?.error || 'Unknown error'}`);
+            }
+          } catch (adminNotifyError) {
+            failureCount++;
+            logger.error(`❌ Error sending push notification to admin ${admin._id}:`, adminNotifyError);
+          }
+        }
+        
+        logger.info(`📊 Notification summary for vendor ticket ${ticket.ticketNumber}: Total admins: ${activeAdmins.length}, Success: ${successCount}, Failed: ${failureCount}`);
+        
+        // Create Notification documents in database for all active admins
+        try {
+          logger.info(`Creating Notification documents for ${activeAdmins.length} active admin(s)`);
+          const notificationPromises = activeAdmins.map(admin => 
+            Notification.create({
+              recipient: admin._id,
+              recipientModel: 'Admin',
+              type: 'ticket_created',
+              title: 'New Ticket Created',
+              message: `Vendor has created a new ticket #${ticket.ticketNumber || ticket._id}. Category: ${ticket.category}`,
+              data: {
+                ticketId: ticket._id.toString(),
+                ticketNumber: ticket.ticketNumber || ticket._id.toString(),
+                category: ticket.category,
+                status: ticket.status,
+                createdBy: 'Vendor',
+                vendorName: ticket.vendor?.vendorName || ticket.vendor?.storeName || 'Vendor',
+                complaint: ticket.complaint.substring(0, 200) + (ticket.complaint.length > 200 ? '...' : ''),
+                orderId: ticket.orderId ? ticket.orderId.toString() : null,
+              },
+              isRead: false,
+              isActive: true,
+            })
+          );
+          
+          const createdNotifications = await Promise.all(notificationPromises);
+          logger.info(`✅ Created ${createdNotifications.length} Notification documents for vendor ticket ${ticket.ticketNumber}`);
+        } catch (dbNotifyError) {
+          // Don't fail the request if notification creation fails
+          logger.error('❌ Error creating Notification documents for vendor ticket:', dbNotifyError);
+        }
+      }
+    } catch (notifyError) {
+      // Don't fail the request if notification fails
+      logger.error('❌ Error in notification process for vendor ticket creation:', notifyError);
+      logger.error('Notification error stack:', notifyError.stack);
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Ticket created successfully',
+      data: {
+        ticket,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to create ticket',
+      message: error.message,
+    });
+  }
+};
+
+// Get all tickets for the logged-in vendor
+exports.getVendorTickets = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    // Ensure vendor is authenticated
+    if (!req.vendor || !req.vendor._id) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied. Vendor privileges required.',
+        message: 'Vendor authentication required to access tickets.',
+      });
+    }
+
+    const vendorId = req.vendor._id;
+    const { page = 1, limit = 10, status, category } = req.query;
+
+    // Build filters
+    const filters = { vendor: vendorId };
+    if (status) {
+      filters.status = status;
+    }
+    if (category) {
+      filters.category = category;
+    }
+
+    // Execute query with pagination
+    const result = await executeQuery(Ticket, {
+      filters,
+      sort: { createdAt: -1 },
+      pagination: { page: parseInt(page), limit: parseInt(limit) },
+      populate: [
+        { path: 'orderId', select: 'orderNumber totalAmount status' },
+        { path: 'createdBy', select: 'vendorName storeName contactNumber email' },
+        { path: 'vendor', select: 'vendorName storeName contactNumber email' },
+      ],
+    });
+
+    // Manually populate messages with sender info for each ticket
+    if (result.data && result.data.length > 0) {
+      for (let ticket of result.data) {
+        if (ticket.messages && ticket.messages.length > 0) {
+          await populateMessages(ticket.messages);
+        }
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Tickets fetched successfully',
+      data: {
+        tickets: result.data,
+        pagination: result.pagination,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch tickets',
+      message: error.message,
+    });
+  }
+};
+
+// Get a single ticket by ID (vendor)
+exports.getVendorTicket = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    const { ticketId } = req.params;
+    const vendorId = req.vendor._id;
+
+    const ticket = await Ticket.findOne({
+      _id: ticketId,
+      vendor: vendorId,
+    })
+      .populate('orderId', 'orderNumber totalAmount status createdAt')
+      .populate('createdBy', 'vendorName storeName contactNumber email')
+      .populate('vendor', 'vendorName storeName contactNumber email');
+
+    // Manually populate messages with sender info
+    if (ticket && ticket.messages && ticket.messages.length > 0) {
+      await populateMessages(ticket.messages);
+    }
+
+    if (!ticket) {
+      return res.status(404).json({
+        success: false,
+        error: 'Ticket not found',
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Ticket fetched successfully',
+      data: {
+        ticket,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch ticket',
+      message: error.message,
+    });
+  }
+};
+
+// Add message to ticket (vendor)
+exports.addVendorTicketMessage = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    const { ticketId } = req.params;
+    const { message } = req.body;
+    const vendorId = req.vendor._id;
+
+    const ticket = await Ticket.findOne({
+      _id: ticketId,
+      vendor: vendorId,
+    });
+
+    if (!ticket) {
+      return res.status(404).json({
+        success: false,
+        error: 'Ticket not found',
+      });
+    }
+
+    // Check if ticket can receive messages (not closed)
+    if (ticket.status === 'closed') {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot add messages to closed tickets',
+      });
+    }
+
+    // Add message
+    ticket.messages.push({
+      sender: vendorId,
+      senderModel: 'Vendor',
+      message,
+      createdAt: new Date(),
+    });
+
+    await ticket.save();
+
+    // Populate messages with sender info
+    await populateMessages(ticket.messages);
+
+    // Also populate other fields
+    await ticket.populate('createdBy', 'vendorName storeName contactNumber email');
+    await ticket.populate('vendor', 'vendorName storeName contactNumber email');
+    await ticket.populate('orderId', 'orderNumber totalAmount status');
+
+    res.status(200).json({
+      success: true,
+      message: 'Message added successfully',
+      data: {
+        ticket,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to add message',
+      message: error.message,
+    });
+  }
+};
+
+// ============ RIDER TICKET FUNCTIONS ============
+
+// Create a new ticket (rider)
+exports.createRiderTicket = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    const { category, complaint, orderId } = req.body;
+    const riderId = req.rider._id;
+
+    // Generate unique ticket number
+    let ticketNumber;
+    try {
+      ticketNumber = await Ticket.generateTicketNumber();
+      if (!ticketNumber) {
+        throw new Error('Failed to generate ticket number');
+      }
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to generate ticket number. Please try again.',
+        message: error.message,
+      });
+    }
+
+    // Create ticket with creator info
+    const ticket = await Ticket.create({
+      ticketNumber,
+      rider: riderId,
+      createdBy: riderId,
+      createdByModel: 'Rider',
+      category: category || 'general_queries',
+      complaint,
+      status: 'active',
+      orderId: orderId || null,
+      messages: [{
+        sender: riderId,
+        senderModel: 'Rider',
+        message: complaint,
+        createdAt: new Date(),
+      }],
+    });
+
+    // Populate messages with sender info
+    await populateMessages(ticket.messages);
+
+    // Populate other fields
+    await ticket.populate('createdBy', 'fullName mobileNumber email');
+    await ticket.populate('rider', 'fullName mobileNumber email');
+    await ticket.populate('orderId', 'orderNumber totalAmount status');
+
+    // Notify all active admins about new rider ticket
+    try {
+      logger.info(`Starting notification process for rider ticket ${ticket.ticketNumber}`);
+      const { sendAdminPushNotification } = require('../utils/firebaseNotification');
+      
+      // Get all active admins with FCM token info
+      const activeAdmins = await Admin.find({ isActive: true }).select('_id name email fcmToken fcmTokens');
+      logger.info(`Found ${activeAdmins.length} active admin(s) to notify`);
+      
+      if (activeAdmins.length === 0) {
+        logger.warn('No active admins found. Skipping notification.');
+      } else {
+        // Check which admins have FCM tokens
+        const adminsWithTokens = activeAdmins.filter(admin => {
+          const hasToken = admin.fcmToken || (admin.fcmTokens && admin.fcmTokens.length > 0);
+          if (!hasToken) {
+            logger.warn(`Admin ${admin._id} (${admin.name || admin.email}) has no FCM tokens`);
+          }
+          return hasToken;
+        });
+        
+        logger.info(`${adminsWithTokens.length} out of ${activeAdmins.length} admin(s) have FCM tokens`);
+        
+        // Prepare notification data
+        const notificationData = {
+          type: 'ticket_created',
+          title: 'New Ticket Created',
+          message: `Rider has created a new ticket #${ticket.ticketNumber || ticket._id}. Category: ${ticket.category}`,
+          ticketId: ticket._id.toString(),
+          data: {
+            ticketId: ticket._id.toString(),
+            ticketNumber: ticket.ticketNumber || ticket._id.toString(),
+            category: ticket.category,
+            status: ticket.status,
+            createdBy: 'Rider',
+            riderName: ticket.rider?.fullName || 'Rider',
+            complaint: ticket.complaint.substring(0, 200) + (ticket.complaint.length > 200 ? '...' : ''),
+            orderId: ticket.orderId ? ticket.orderId.toString() : null,
+          },
+        };
+        
+        // Send push notification to each admin
+        let successCount = 0;
+        let failureCount = 0;
+        
+        for (const admin of activeAdmins) {
+          try {
+            logger.info(`Attempting to send notification to admin ${admin._id} (${admin.name || admin.email})`);
+            const pushResult = await sendAdminPushNotification(admin._id, notificationData);
+            if (pushResult && pushResult.success) {
+              successCount++;
+              logger.info(`✅ Push notification sent successfully to admin ${admin._id} for rider ticket ${ticket.ticketNumber}. Success count: ${pushResult.successCount}, Failed: ${pushResult.failureCount}`);
+            } else {
+              failureCount++;
+              logger.warn(`❌ Failed to send push notification to admin ${admin._id}: ${pushResult?.error || 'Unknown error'}`);
+            }
+          } catch (adminNotifyError) {
+            failureCount++;
+            logger.error(`❌ Error sending push notification to admin ${admin._id}:`, adminNotifyError);
+          }
+        }
+        
+        logger.info(`📊 Notification summary for rider ticket ${ticket.ticketNumber}: Total admins: ${activeAdmins.length}, Success: ${successCount}, Failed: ${failureCount}`);
+        
+        // Create Notification documents in database for all active admins
+        try {
+          logger.info(`Creating Notification documents for ${activeAdmins.length} active admin(s)`);
+          const notificationPromises = activeAdmins.map(admin => 
+            Notification.create({
+              recipient: admin._id,
+              recipientModel: 'Admin',
+              type: 'ticket_created',
+              title: 'New Ticket Created',
+              message: `Rider has created a new ticket #${ticket.ticketNumber || ticket._id}. Category: ${ticket.category}`,
+              data: {
+                ticketId: ticket._id.toString(),
+                ticketNumber: ticket.ticketNumber || ticket._id.toString(),
+                category: ticket.category,
+                status: ticket.status,
+                createdBy: 'Rider',
+                riderName: ticket.rider?.fullName || 'Rider',
+                complaint: ticket.complaint.substring(0, 200) + (ticket.complaint.length > 200 ? '...' : ''),
+                orderId: ticket.orderId ? ticket.orderId.toString() : null,
+              },
+              isRead: false,
+              isActive: true,
+            })
+          );
+          
+          const createdNotifications = await Promise.all(notificationPromises);
+          logger.info(`✅ Created ${createdNotifications.length} Notification documents for rider ticket ${ticket.ticketNumber}`);
+        } catch (dbNotifyError) {
+          // Don't fail the request if notification creation fails
+          logger.error('❌ Error creating Notification documents for rider ticket:', dbNotifyError);
+        }
+      }
+    } catch (notifyError) {
+      // Don't fail the request if notification fails
+      logger.error('❌ Error in notification process for rider ticket creation:', notifyError);
+      logger.error('Notification error stack:', notifyError.stack);
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Ticket created successfully',
+      data: {
+        ticket,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to create ticket',
+      message: error.message,
+    });
+  }
+};
+
+// Get all tickets for the logged-in rider
+exports.getRiderTickets = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    const riderId = req.rider._id;
+    const { page = 1, limit = 10, status, category } = req.query;
+
+    // Build filters
+    const filters = { rider: riderId };
+    if (status) {
+      filters.status = status;
+    }
+    if (category) {
+      filters.category = category;
+    }
+
+    // Execute query with pagination
+    const result = await executeQuery(Ticket, {
+      filters,
+      sort: { createdAt: -1 },
+      pagination: { page: parseInt(page), limit: parseInt(limit) },
+      populate: [
+        { path: 'orderId', select: 'orderNumber totalAmount status' },
+        { path: 'createdBy', select: 'fullName mobileNumber email' },
+        { path: 'rider', select: 'fullName mobileNumber email' },
+      ],
+    });
+
+    // Manually populate messages with sender info for each ticket
+    if (result.data && result.data.length > 0) {
+      for (let ticket of result.data) {
+        if (ticket.messages && ticket.messages.length > 0) {
+          await populateMessages(ticket.messages);
+        }
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Tickets fetched successfully',
+      data: {
+        tickets: result.data,
+        pagination: result.pagination,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch tickets',
+      message: error.message,
+    });
+  }
+};
+
+// Get a single ticket by ID (rider)
+exports.getRiderTicket = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    const { ticketId } = req.params;
+    const riderId = req.rider._id;
+
+    const ticket = await Ticket.findOne({
+      _id: ticketId,
+      rider: riderId,
+    })
+      .populate('orderId', 'orderNumber totalAmount status createdAt')
+      .populate('createdBy', 'fullName mobileNumber email')
+      .populate('rider', 'fullName mobileNumber email');
+
+    // Manually populate messages with sender info
+    if (ticket && ticket.messages && ticket.messages.length > 0) {
+      await populateMessages(ticket.messages);
+    }
+
+    if (!ticket) {
+      return res.status(404).json({
+        success: false,
+        error: 'Ticket not found',
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Ticket fetched successfully',
+      data: {
+        ticket,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch ticket',
+      message: error.message,
+    });
+  }
+};
+
+// Add message to ticket (rider)
+exports.addRiderTicketMessage = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        errors: errors.array(),
+      });
+    }
+
+    const { ticketId } = req.params;
+    const { message } = req.body;
+    const riderId = req.rider._id;
+
+    const ticket = await Ticket.findOne({
+      _id: ticketId,
+      rider: riderId,
+    });
+
+    if (!ticket) {
+      return res.status(404).json({
+        success: false,
+        error: 'Ticket not found',
+      });
+    }
+
+    // Check if ticket can receive messages (not closed)
+    if (ticket.status === 'closed') {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot add messages to closed tickets',
+      });
+    }
+
+    // Add message
+    ticket.messages.push({
+      sender: riderId,
+      senderModel: 'Rider',
+      message,
+      createdAt: new Date(),
+    });
+
+    await ticket.save();
+
+    // Populate messages with sender info
+    await populateMessages(ticket.messages);
+
+    // Also populate other fields
+    await ticket.populate('createdBy', 'fullName mobileNumber email');
+    await ticket.populate('rider', 'fullName mobileNumber email');
+    await ticket.populate('orderId', 'orderNumber totalAmount status');
+
+    res.status(200).json({
+      success: true,
+      message: 'Message added successfully',
+      data: {
+        ticket,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to add message',
+      message: error.message,
+    });
+  }
+};
